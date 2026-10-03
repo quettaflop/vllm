@@ -17,7 +17,11 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    override_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
@@ -335,6 +339,54 @@ class DeepseekV4DecoderLayer(nn.Module):
         torch.Tensor,
         torch.Tensor | None,
     ]:
+        x, residual, post_mix, res_mix, attn_pre, previous_aux = (
+            self.forward_attn_input(
+                x,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                engram_hashes,
+                engram_mask,
+                capture_previous_aux=capture_previous_aux,
+            )
+        )
+
+        if self.use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
+
+        x = self.attn(positions, x, None)
+        if self.use_sequence_parallel:
+            x = sp_reduce_scatter(x)
+
+        x, residual, post_mix, res_mix, ffn_pre = self.forward_ffn(
+            x, residual, post_mix, res_mix, attn_pre, input_ids
+        )
+        return x, residual, post_mix, res_mix, ffn_pre, previous_aux
+
+    def forward_attn_input(
+        self,
+        x: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        engram_hashes: torch.Tensor | None = None,
+        engram_mask: torch.Tensor | None = None,
+        *,
+        capture_previous_aux: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """``forward`` up to the attention input: the previous sublayer's post
+        and this layer's attention pre. Returns the attention input, the mHC
+        state, the attention pre-mix and the previous layer's aux hidden state
+        when captured."""
         previous_aux: torch.Tensor | None = None
         # The reference collapses each sublayer's input with the *previous*
         # sublayer's pre-mix: attention uses the pre-mix carried in (identity
@@ -425,14 +477,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if capture_previous_aux:
                 previous_aux = aux
+        return x, residual, post_mix, res_mix, attn_pre, previous_aux
 
-        if self.use_sequence_parallel:
-            x = sp_all_gather(x)[: positions.shape[0]]
-
-        x = self.attn(positions, x, None)
-        if self.use_sequence_parallel:
-            x = sp_reduce_scatter(x)
-
+    def forward_ffn(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        attn_pre: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``forward`` from the attention output on: the attention post, the
+        FFN pre and the FFN. Returns the FFN output, the mHC state and the FFN
+        pre-mix."""
         residual, post_mix, res_mix, x, ffn_pre, _ = mhc_shifted_post_pre(
             x,
             residual,
@@ -451,7 +509,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_eps=self.ffn_norm.variance_epsilon,
         )
         x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix, ffn_pre, previous_aux
+        return x, residual, post_mix, res_mix, ffn_pre
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
@@ -533,30 +591,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
 
-        # Decoder-side SWA bounded replay: in eager prefill steps the layers past
-        # the last KV source run on each request's trailing window only
-        # (decoder_replay_layers.py).
+        # Decoder-side SWA bounded replay: in eager prefill steps the last KV
+        # source layer's query side and FFN, and every layer after it, run on
+        # each request's trailing window only (decoder_replay_layers.py).
         self.decoder_replay_layers: DecoderReplayLayers | None = None
-        self.decoder_replay_start = self.end_layer
         cut = max(config.kv_source_layer_ids)
+        self.decoder_replay_cut = cut
         if (
             cut < self.end_layer - 1
             and self._decoder_replay_supported(vllm_config, cut)
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
         ):
-            self.decoder_replay_start = cut + 1
-            self.decoder_replay_layers = DecoderReplayLayers(
-                config.sliding_window,
-                self._run_replay_layers,
-                [
-                    buf
-                    for buf in (self.topk_indices_buffer, self.candidate_block_buffer)
-                    if buf is not None
-                ],
-            )
+            self.decoder_replay_layers = DecoderReplayLayers(config.sliding_window)
             logger.info_once(
-                "Decoder SWA bounded replay: in eager prefill steps, layers "
-                "%d-%d run on each request's last %d tokens only.",
+                "Decoder SWA bounded replay: in eager prefill steps, layer %d "
+                "writes its KV for every token and runs the rest of itself and "
+                "layers %d-%d on each request's last %d tokens only.",
+                cut,
                 cut + 1,
                 self.end_layer - 1,
                 config.sliding_window,
@@ -732,8 +783,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             pre_mix = intermediate_tensors["pre_mix"]
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+        replay = self.decoder_replay_layers
+        replays = replay is not None and replay.rows is not None
         hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
+            range(
+                self.start_layer,
+                self.decoder_replay_cut if replays else self.end_layer,
+            ),
             hidden_states,
             positions,
             input_ids,
@@ -745,9 +801,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             engram_hashes,
             engram_mask,
         )
-        late_aux: list[torch.Tensor] = []
-        if self.decoder_replay_layers is not None:
-            hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
+        if replays:
+            hidden_states, pre_mix = self._run_replay(
                 hidden_states,
                 positions,
                 input_ids,
@@ -755,6 +810,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 post_mix,
                 res_mix,
                 residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
             )
         else:
             hidden_states = self._collapse(
@@ -770,7 +828,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             aux_hidden_by_layer[layer_id]
             for layer_id in self.aux_hidden_state_layers
             if layer_id in aux_hidden_by_layer
-        ] + late_aux
+        ]
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -817,9 +875,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         aux_hidden_by_layer: dict[int, torch.Tensor],
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
-    ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
         full_num_tokens = positions.shape[0]
@@ -872,7 +928,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             aux_hidden_by_layer[self.end_layer] = final_aux
         return hidden_states
 
-    def _run_replay_layers(
+    def _run_replay(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
@@ -881,39 +937,88 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         post_mix: torch.Tensor,
         res_mix: torch.Tensor,
         residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, ...]:
-        """The layers past the last KV source, on whatever rows they are given;
-        returns their output, the last FFN's pre-mix and the aux hidden states
-        they capture."""
-        aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.decoder_replay_start, self.end_layer),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
+        aux_hidden_by_layer: dict[int, torch.Tensor],
+        engram_hashes: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The cut layer and the layers after it, in a replay step; returns the
+        collapsed output and the last FFN's pre-mix, at batch rows.
+
+        The cut layer writes its KV (SWA, compressed and index K) for every row:
+        the layers after it and later steps read it. Its query side (the
+        indexer's full-context scoring and top-k, sparse attention, wo), its FFN
+        and the layers after it feed only the replay rows' outputs, so they run
+        on those rows. The cut layer's query side keeps the encoder-side window
+        starts, as every row's window KV is there, so it is exact; the layers
+        after it see each request's window from its first replay row. Outputs
+        and aux hidden states of the trimmed rows stay zero; nothing reads them.
+        """
+        replay = self.decoder_replay_layers
+        assert replay is not None and replay.rows is not None
+        assert replay.forward_context is not None
+        assert replay.cut_forward_context is not None
+        rows = replay.rows
+        cut = self.decoder_replay_cut
+        cut_layer = typing.cast(DeepseekV4DecoderLayer, self.layers[cut])
+
+        x, residual, post_mix, res_mix, attn_pre, previous_aux = (
+            cut_layer.forward_attn_input(
+                hidden_states,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                engram_hashes,
+                engram_mask,
+                capture_previous_aux=cut in self.aux_hidden_state_layers,
+            )
         )
-        hidden_states = self._collapse(
-            hidden_states,
-            residual,
-            post_mix,
-            res_mix,
-            aux_hidden_by_layer,
-            positions.shape[0],
-        )
-        return (
-            hidden_states,
-            pre_mix,
-            *(
-                aux_hidden_by_layer[layer_id]
-                for layer_id in self.aux_hidden_state_layers
-                if layer_id in aux_hidden_by_layer
-            ),
-        )
+        if previous_aux is not None:
+            aux_hidden_by_layer[cut] = previous_aux
+        query_inputs = cut_layer.attn.forward_kv(positions, x)
+
+        def select(t: torch.Tensor) -> torch.Tensor:
+            return t.index_select(0, rows)
+
+        row_positions = select(positions)
+        row_input_ids = None if input_ids is None else select(input_ids)
+        with override_forward_context(replay.cut_forward_context):
+            x = cut_layer.attn.forward_query(
+                row_positions, select(x), query_inputs.select(rows)
+            )
+        row_aux: dict[int, torch.Tensor] = {}
+        with override_forward_context(replay.forward_context):
+            x, residual, post_mix, res_mix, pre_mix = cut_layer.forward_ffn(
+                x,
+                select(residual),
+                select(post_mix),
+                select(res_mix),
+                select(attn_pre),
+                row_input_ids,
+            )
+            x, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(cut + 1, self.end_layer),
+                x,
+                row_positions,
+                row_input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                row_aux,
+            )
+            x = self._collapse(
+                x, residual, post_mix, res_mix, row_aux, row_positions.shape[0]
+            )
+
+        num_tokens = positions.shape[0]
+
+        def scatter(t: torch.Tensor) -> torch.Tensor:
+            return t.new_zeros((num_tokens, *t.shape[1:])).index_copy_(0, rows, t)
+
+        for layer_id, aux in row_aux.items():
+            aux_hidden_by_layer[layer_id] = scatter(aux)
+        return scatter(x), scatter(pre_mix)
 
     def _decoder_replay_supported(self, vllm_config: VllmConfig, cut: int) -> bool:
         """Whether this rank may trim the layers after ``cut``; warns when not."""
