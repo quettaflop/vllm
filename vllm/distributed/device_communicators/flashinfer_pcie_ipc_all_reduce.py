@@ -6,6 +6,12 @@ This backend targets small tensor-parallel all-reduces on a single PCIe-only
 node.  Its workspace has a stricter lifetime and stream contract than the
 existing FlashInfer MNNVL/TRT-LLM all-reduce implementation, so it intentionally
 lives behind a separate wrapper and an opt-in environment variable.
+
+The kernels spin on peer flags with no timeout and no metadata exchange, so
+every rank must issue the same sequence of collective calls.  A rank that
+quietly falls back to another backend while its peers still use the IPC path
+leaves the group spinning, so this wrapper disables the backend group-wide
+(never on a single rank) whenever any rank cannot support it.
 """
 
 from collections.abc import Sequence
@@ -20,6 +26,7 @@ from torch.distributed import ProcessGroup
 from vllm.distributed.parallel_state import in_the_same_node_as
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import import_pynvml
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -28,6 +35,88 @@ logger = init_logger(__name__)
 
 _SUPPORTED_WORLD_SIZES = (2, 4, 8)
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
+
+
+def _collective_disable_reason(rank_errors: Sequence[str | None]) -> str | None:
+    """Collapse per-rank local failures into one group-wide disable reason.
+
+    The IPC kernels have no timeout, so a single rank dropping out while its
+    peers keep going hangs the group.  Every rank must reach the same decision;
+    this turns the gathered per-rank reasons into a single message so they all
+    disable the backend together.
+
+    Args:
+        rank_errors: Local failure reason for each group rank, or None when
+            that rank can use the backend.
+
+    Returns:
+        None when every rank is ready, otherwise a message naming the ranks
+        that failed and why.
+    """
+    failed = [
+        f"rank {rank} ({error})"
+        for rank, error in enumerate(rank_errors)
+        if error is not None
+    ]
+    if not failed:
+        return None
+    return (
+        "FlashInfer PCIe IPC all-reduce is unavailable on "
+        f"{len(failed)}/{len(rank_errors)} ranks; disabling it group-wide: "
+        + ", ".join(failed)
+    )
+
+
+def _island_placement_error(
+    numa_nodes: Sequence[int | None], world_size: int
+) -> str | None:
+    """Check the 4+4 island rule the copy-engine schedule assumes.
+
+    FlashInfer's ``COPY_ENGINE_ISLAND`` decomposition assigns island 0 to ranks
+    0-3 and island 1 to ranks 4-7, so the grouping only describes the fabric
+    when each half is co-socket.  It is reachable at world size 8 only (see
+    ``flashinfer.comm.pcie_ipc_policy``).  A single NUMA/socket domain needs no
+    split, and an undeterminable mapping is left alone rather than guessed at.
+
+    Args:
+        numa_nodes: NUMA node id of each rank's GPU, or None when it could not
+            be determined.
+        world_size: Size of the process group.
+
+    Returns:
+        A message describing the violation, or None when the placement is
+        acceptable or cannot be judged.
+    """
+    if world_size != 8 or any(node is None for node in numa_nodes):
+        return None
+    if len(set(numa_nodes)) < 2:
+        return None
+    if len(set(numa_nodes[:4])) == 1 and len(set(numa_nodes[4:])) == 1:
+        return None
+    return (
+        "FlashInfer PCIe IPC all-reduce needs the 4+4 island decomposition to "
+        "align with NUMA/socket domains, but ranks 0-3 map to NUMA nodes "
+        f"{list(numa_nodes[:4])} and ranks 4-7 to {list(numa_nodes[4:])}"
+    )
+
+
+def _local_numa_node(device: torch.device) -> int | None:
+    """NUMA node hosting this rank's GPU, or None when NVML cannot report it."""
+    try:
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.accelerator.current_device_index()
+        uuid = current_platform.get_device_uuid(device_index)
+        pynvml = import_pynvml()
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            return int(pynvml.nvmlDeviceGetNumaNodeId(handle))
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # noqa: BLE001 - unknown placement stays with another backend
+        return None
+
 
 try:
     import flashinfer.comm as flashinfer_comm
@@ -39,7 +128,18 @@ except ImportError:
 
 
 class FlashInferPcieIpcAllReduce:
-    """vLLM lifecycle wrapper for FlashInfer's PCIe IPC all-reduce."""
+    """vLLM lifecycle wrapper for FlashInfer's PCIe IPC all-reduce.
+
+    The underlying workspace is a strict collective: every rank must issue the
+    same sequence of calls with the same shape, dtype and launch configuration,
+    and a rank that falls back on its own hangs the group.  This wrapper makes
+    that fallback group-wide instead.
+
+    The workspace also serves a single CUDA stream.  Its epoch and arrival
+    counters assume the calls sharing it are totally ordered, which stream
+    order gives and concurrent streams do not; build one instance, and hence
+    one workspace, per stream rather than sharing one across streams.
+    """
 
     def __init__(
         self,
@@ -57,36 +157,61 @@ class FlashInferPcieIpcAllReduce:
         self.hidden_dim = 0
         self.dtype: torch.dtype | None = None
 
-        if not _pcie_ipc_available:
+        # Resolve the local reasons before the exchange below, which every rank
+        # must enter so the group agrees on one decision.
+        reason = self._local_support_error()
+        reason = self._collective_support_error(reason)
+        if reason is not None:
             logger.warning_once(
-                "FlashInfer PCIe IPC all-reduce was requested but this "
-                "FlashInfer build does not provide PcieIpcAllReduceWorkspace; "
-                "falling back to another all-reduce backend."
-            )
-            return
-        if not current_platform.is_cuda():
-            logger.warning_once(
-                "FlashInfer PCIe IPC all-reduce requires the CUDA platform."
-            )
-            return
-        if self.world_size not in _SUPPORTED_WORLD_SIZES:
-            logger.warning_once(
-                "FlashInfer PCIe IPC all-reduce does not support world_size=%d; "
-                "supported sizes are %s.",
-                self.world_size,
-                _SUPPORTED_WORLD_SIZES,
-            )
-            return
-        if not all(in_the_same_node_as(tune_group, source_rank=0)):
-            logger.warning_once(
-                "FlashInfer PCIe IPC all-reduce requires every rank in the TP "
-                "group to be on one node."
+                "FlashInfer PCIe IPC all-reduce was requested but is disabled "
+                "on every rank: %s. Falling back to another all-reduce backend.",
+                reason,
             )
             return
 
         # Setup is deferred until kernel_warmup, where the model hidden size and
         # exact CUDA Graph buckets are known. Until then dispatch falls through.
         self.disabled = False
+
+    def _local_support_error(self) -> str | None:
+        """Why this rank alone cannot use the backend, or None if it can."""
+        if not _pcie_ipc_available:
+            return "this FlashInfer build does not provide PcieIpcAllReduceWorkspace"
+        if not current_platform.is_cuda():
+            return "it requires the CUDA platform"
+        if self.world_size not in _SUPPORTED_WORLD_SIZES:
+            return (
+                f"it does not support world_size={self.world_size} "
+                f"(supported: {_SUPPORTED_WORLD_SIZES})"
+            )
+        return None
+
+    def _collective_support_error(self, local_error: str | None) -> str | None:
+        """Agree group-wide on whether the backend can be used.
+
+        Every rank calls this with its own local result, so the exchange and
+        the topology checks below are entered by the whole group.  A failure on
+        any rank disables the backend on all of them, which an asymmetric
+        fallback would not.
+        """
+        errors: list[str | None] = [None] * self.world_size
+        dist.all_gather_object(errors, local_error, group=self.group)
+        group_error = _collective_disable_reason(errors)
+        if group_error is not None:
+            return group_error
+
+        if not all(in_the_same_node_as(self.tune_group, source_rank=0)):
+            return "the TP group is not on a single node"
+
+        if self.world_size == 8:
+            numa_nodes: list[int | None] = [None] * self.world_size
+            dist.all_gather_object(
+                numa_nodes, _local_numa_node(self.device), group=self.group
+            )
+            placement_error = _island_placement_error(numa_nodes, self.world_size)
+            if placement_error is not None:
+                return placement_error
+        return None
 
     @property
     def initialized(self) -> bool:
