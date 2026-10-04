@@ -100,6 +100,10 @@ class NixlBaseConnectorScheduler:
             )
         )
         self._has_mamba = kv_cache_config.has_mamba_layers
+        self._bounded_replay = any(
+            g.kv_cache_spec.prefix_replay_tokens > 0
+            for g in kv_cache_config.kv_cache_groups
+        )
 
         logger.info("Initializing NIXL Scheduler %s", engine_id)
         if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
@@ -199,7 +203,11 @@ class NixlBaseConnectorScheduler:
     def on_new_request(self, request: "Request") -> None:
         """Track a request that may need heartbeats."""
         params = request.kv_transfer_params
-        if params is not None and params.get("do_remote_decode") and self._has_mamba:
+        if (
+            params is not None
+            and params.get("do_remote_decode")
+            and (self._has_mamba or self._bounded_replay)
+        ):
             self._truncate_mamba_request_for_prefill(request)
 
         # NOTE (NickLucche) This excludes request meant for P, ie heartbeats are
@@ -384,8 +392,10 @@ class NixlBaseConnectorScheduler:
 
     def _get_remote_prefill_token_count(self, num_prompt_tokens: int) -> int:
         """D-side only. Returns N-1 for Mamba models since the decoder
-        always recomputes the last token and must start from h(N-1)."""
-        if self._has_mamba and num_prompt_tokens > 1:
+        always recomputes the last token and must start from h(N-1). Also N-1
+        under DSV41 bounded replay: a P/D load is not replayed, so the sliding
+        window must be laid out for the token the decoder recomputes."""
+        if (self._has_mamba or self._bounded_replay) and num_prompt_tokens > 1:
             return num_prompt_tokens - 1
         return num_prompt_tokens
 
