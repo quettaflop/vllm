@@ -30,6 +30,88 @@ def _uninitialized_comm() -> pcie_ipc.FlashInferPcieIpcAllReduce:
     return comm
 
 
+def test_collective_disable_reason_none_when_all_ranks_ready():
+    assert pcie_ipc._collective_disable_reason([None, None, None, None]) is None
+
+
+def test_collective_disable_reason_names_failing_rank():
+    reason = pcie_ipc._collective_disable_reason([None, "no workspace", None, None])
+    assert reason is not None
+    assert "rank 1 (no workspace)" in reason
+    assert "1/4 ranks" in reason
+
+
+@pytest.mark.parametrize(
+    ("numa_nodes", "world_size", "expected"),
+    [
+        # The rule only applies to the world-8 island decomposition.
+        ([0, 1, 0, 1], 4, None),
+        # A single NUMA/socket domain needs no split.
+        ([0] * 8, 8, None),
+        # gpu07-style layout: each half is co-socket.
+        ([0, 0, 0, 0, 1, 1, 1, 1], 8, None),
+        # Any undeterminable rank leaves the mapping unjudged.
+        ([0, 0, 0, 0, None, 1, 1, 1], 8, None),
+        # Interleaved sockets break the 4+4 grouping.
+        ([0, 1, 0, 1, 0, 1, 0, 1], 8, "ranks 0-3"),
+        # Only the first half has to be homogeneous.
+        ([0, 1, 0, 0, 1, 1, 1, 1], 8, "ranks 0-3"),
+    ],
+)
+def test_island_placement_error(numa_nodes, world_size, expected):
+    reason = pcie_ipc._island_placement_error(numa_nodes, world_size)
+    if expected is None:
+        assert reason is None
+    else:
+        assert reason is not None
+        assert expected in reason
+
+
+def test_collective_support_error_disables_group_when_any_rank_fails(monkeypatch):
+    comm = _uninitialized_comm()
+    comm.world_size = 4
+
+    def fake_all_gather_object(output, obj, group=None):
+        output[:] = [None, None, "no workspace", None]
+
+    monkeypatch.setattr(pcie_ipc.dist, "all_gather_object", fake_all_gather_object)
+
+    reason = comm._collective_support_error(None)
+
+    assert reason is not None
+    assert "rank 2 (no workspace)" in reason
+
+
+def test_collective_support_error_accepts_single_node(monkeypatch):
+    comm = _uninitialized_comm()
+    comm.world_size = 4
+
+    def fake_all_gather_object(output, obj, group=None):
+        output[:] = [None] * len(output)
+
+    monkeypatch.setattr(pcie_ipc.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(pcie_ipc, "in_the_same_node_as", lambda *a, **k: [True] * 4)
+
+    assert comm._collective_support_error(None) is None
+
+
+def test_collective_support_error_rejects_multi_node(monkeypatch):
+    comm = _uninitialized_comm()
+    comm.world_size = 4
+
+    def fake_all_gather_object(output, obj, group=None):
+        output[:] = [None] * len(output)
+
+    monkeypatch.setattr(pcie_ipc.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(
+        pcie_ipc, "in_the_same_node_as", lambda *a, **k: [True, True, False, True]
+    )
+
+    assert (
+        comm._collective_support_error(None) == "the TP group is not on a single node"
+    )
+
+
 def test_setup_uses_exact_graph_capacity(monkeypatch, tmp_path):
     workspace = Mock()
     factory = Mock(return_value=workspace)
