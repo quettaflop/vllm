@@ -1320,6 +1320,17 @@ class DeepseekV4Indexer(nn.Module):
             # (skip_k_cache_insert=True).
             self._produce_k(latent, positions, rotary_emb)
 
+        return self.forward_q(qr, qr_scale, indexer_weights, positions, rotary_emb)
+
+    def forward_q(
+        self,
+        qr: torch.Tensor | QuantizedActivation,
+        qr_scale: torch.Tensor | None,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        rotary_emb: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """The indexer's query side: its Q projection, RoPE and quantization."""
         q = self._wq_b_proj(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
         q_quant, weights = fused_indexer_q_rope_quant(
