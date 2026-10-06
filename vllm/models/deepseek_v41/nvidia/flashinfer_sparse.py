@@ -25,6 +25,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import (
@@ -123,6 +124,9 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+        # SM12x uses 64 physical rows: C1/C2 cover 64/128 logical tokens.
+        if current_platform.is_device_capability_family(120):
+            return [64, 128]
         return [128]
 
     @staticmethod
