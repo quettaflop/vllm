@@ -280,8 +280,8 @@ class Scheduler(SchedulerInterface):
             max_num_query_reqs = self.scheduler_config.max_num_batched_tokens // (
                 1 + self.num_spec_tokens
             )
-            self.max_num_active_reqs = min(
-                self.max_num_active_reqs, max(1, max_num_query_reqs)
+            self.max_num_running_reqs = min(
+                self.max_num_running_reqs, max(1, max_num_query_reqs)
             )
         # DSV41 SWA bounded replay: groups that declare a replay window are rebuilt
         # after a prefix hit by recomputing its trailing tokens. One window
