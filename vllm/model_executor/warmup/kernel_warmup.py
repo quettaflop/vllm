@@ -453,7 +453,14 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         world.barrier()
         tuner.load_configs(str(cache_path))
 
-    group = world.cpu_group if world.world_size > 1 else None
+    # Under pipeline parallelism each stage runs different layers and therefore
+    # tunes different ops; a world-wide tuning group deadlocks (one stage blocks
+    # in an op's OOM/timing collective while the other waits at the barrier).
+    # Tune within each stage's TP group instead.
+    from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+
+    tune_group = get_tp_group() if get_pp_group().world_size > 1 else world
+    group = tune_group.cpu_group if tune_group.world_size > 1 else None
     set_autotune_process_group(group)
     try:
         with (
