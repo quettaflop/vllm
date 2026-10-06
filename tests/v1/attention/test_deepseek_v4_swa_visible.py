@@ -139,6 +139,7 @@ def run_swa_kernel(
     swa_indices = torch.zeros(num_tokens, 1, width, dtype=torch.int32, device=device)
     swa_lens = torch.zeros(num_tokens, dtype=torch.int32, device=device)
     is_valid = slot_mapping >= 0
+    replay_start_t = torch.zeros(len(seq_lens), dtype=torch.int32, device=device)
 
     if with_image:
         lefts, rights = ref_left_right(
@@ -164,6 +165,7 @@ def run_swa_kernel(
         block_table,
         block_table.stride(0),
         BLOCK_SIZE,
+        replay_start_t,
         token_offset=0,
         HAS_IMAGE=with_image,
         TRITON_BLOCK_SIZE=1024,
