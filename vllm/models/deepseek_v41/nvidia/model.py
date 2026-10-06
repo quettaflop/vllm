@@ -785,22 +785,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         replay = self.decoder_replay_layers
         replays = replay is not None and replay.rows is not None
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(
-                self.start_layer,
-                self.decoder_replay_cut if replays else self.end_layer,
-            ),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
-            engram_hashes,
-            engram_mask,
-        )
+        first_end = self.decoder_replay_cut if replays else self.end_layer
+        # A pipeline stage that starts at the cut layer has nothing before it.
+        if first_end > self.start_layer:
+            hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(self.start_layer, first_end),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
         if replays:
             hidden_states, pre_mix = self._run_replay(
                 hidden_states,
@@ -933,10 +933,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
-        pre_mix: torch.Tensor,
-        post_mix: torch.Tensor,
-        res_mix: torch.Tensor,
-        residual: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
         aux_hidden_by_layer: dict[int, torch.Tensor],
         engram_hashes: torch.Tensor | None,
         engram_mask: torch.Tensor | None,
