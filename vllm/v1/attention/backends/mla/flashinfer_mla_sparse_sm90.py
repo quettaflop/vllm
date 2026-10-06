@@ -43,6 +43,7 @@ from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer_sm90_nope_mla
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -62,6 +63,21 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
 _FP8_KV_DTYPES = ("fp8", "fp8_e4m3")
 _WORKSPACE_BYTES = 128 * 1024 * 1024
+_PACK_BLOCK = 1024
+
+
+@triton.jit
+def _pack_topk_rows_kernel(
+    src_ptr, dst_ptr, off_ptr, len_ptr, width, BLOCK: tl.constexpr
+):
+    # Row t's valid slots are src[t, :len[t]]; they land at dst[off[t]:].
+    t = tl.program_id(0)
+    j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    n = tl.load(len_ptr + t)
+    o = tl.load(off_ptr + t)
+    mask = j < n
+    v = tl.load(src_ptr + t * width + j, mask=mask, other=0)
+    tl.store(dst_ptr + o + j, tl.maximum(v, 0).to(tl.int32), mask=mask)
 
 
 class FlashInferMLASparseSM90Backend(AttentionBackend):
@@ -104,7 +120,8 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major == 9
+        # SM120 runs FlashInfer's FA2 MLA path, which takes BF16 KV only.
+        return capability.major in (9, 12)
 
     @classmethod
     def supports_combination(
@@ -127,6 +144,8 @@ class FlashInferMLASparseSM90Backend(AttentionBackend):
             )
         if not use_sparse:
             return "FLASHINFER_MLA_SPARSE_SM90 requires sparse MLA"
+        if device_capability.major == 12 and kv_cache_dtype in _FP8_KV_DTYPES:
+            return "FLASHINFER_MLA_SPARSE_SM90 supports FP8 KV on SM90 only"
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
@@ -175,6 +194,7 @@ class _SM90State:
     ) -> None:
         from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
+        self.packed_rows = torch.cuda.get_device_capability(device)[0] != 9
         self.workspace = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
         self.device = device
         self.num_heads = num_heads
@@ -199,8 +219,15 @@ class _SM90State:
             kv_indices=self.kv_indices,
             kv_len_arr=self.kv_len_arr,
             use_cuda_graph=True,
-            backend="fa3",
+            # FA3 needs Hopper; SM120 (BF16 KV only) runs the FA2 kernel.
+            backend="fa2" if self.packed_rows else "fa3",
         )
+        # FA2 requires kv_indptr to hold each row's exact length, so its rows
+        # are packed end to end; the per-row offsets and lengths are copied to
+        # these buffers at plan time and read by the packing kernel in the
+        # (possibly captured) forward.
+        self.row_off = torch.zeros(max_tokens + 1, dtype=torch.int32, device=device)
+        self.row_len = torch.zeros(max_tokens, dtype=torch.int32, device=device)
         self._arange_cpu = torch.arange(self.max_tokens + 1, dtype=torch.int32)
         self._qo_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)
         self._kv_cpu = torch.empty(self.max_tokens + 1, dtype=torch.int32)
@@ -237,9 +264,18 @@ class _SM90State:
         # and schedule no work. Padded rows keep the full width lens; the
         # value is never dereferenced.
         torch.clamp(self._arange_cpu, max=num_tokens, out=self._qo_cpu)
-        torch.mul(self._qo_cpu, self.topk_width, out=self._kv_cpu)
-        self._lens_cpu.fill_(self.topk_width)
-        self._lens_cpu[:num_tokens] = kv_lens.to(torch.int32)
+        if self.packed_rows:
+            # FA2: rows end to end with exact lengths; padded rows are empty.
+            self._lens_cpu.zero_()
+            self._lens_cpu[:num_tokens] = kv_lens.to(torch.int32)
+            self._kv_cpu[0] = 0
+            torch.cumsum(self._lens_cpu, 0, dtype=torch.int32, out=self._kv_cpu[1:])
+            self.row_off.copy_(self._kv_cpu)
+            self.row_len.copy_(self._lens_cpu)
+        else:
+            torch.mul(self._qo_cpu, self.topk_width, out=self._kv_cpu)
+            self._lens_cpu.fill_(self.topk_width)
+            self._lens_cpu[:num_tokens] = kv_lens.to(torch.int32)
         self.wrapper.plan(
             self._qo_cpu,
             self._kv_cpu,
@@ -465,9 +501,20 @@ class FlashInferMLASparseSM90Impl(SparseMLACommonImpl[FlashInferMLASparseSM90Met
         # Refresh top-k rows in graph and clamp masked tails to a valid slot;
         # per-row lengths are already baked into the host-side plan.
         width = topk_slots.shape[1]
-        state.kv_indices[: num_tokens * width].copy_(
-            topk_slots.reshape(-1).clamp_(min=0).to(torch.int32)
-        )
+        if state.packed_rows:
+            grid = (num_tokens, triton.cdiv(width, _PACK_BLOCK))
+            _pack_topk_rows_kernel[grid](
+                topk_slots,
+                state.kv_indices,
+                state.row_off,
+                state.row_len,
+                width,
+                BLOCK=_PACK_BLOCK,
+            )
+        else:
+            state.kv_indices[: num_tokens * width].copy_(
+                topk_slots.reshape(-1).clamp_(min=0).to(torch.int32)
+            )
 
         flat = (
             kv_c_and_k_pe_cache.view(torch.float8_e4m3fn)
