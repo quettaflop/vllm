@@ -412,7 +412,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_eps=self.attn_norm.variance_epsilon,
                 )
             else:
+                # First layer of a later pipeline stage: the stream arrives with
+                # the previous stage's last post already applied.
                 residual = x
+                if self.engram is not None and engram_hashes is not None:
+                    # Engram injects between that post and this block's pre,
+                    # as in the mid-stage branch below.
+                    residual = self.engram(
+                        residual,
+                        engram_hashes[:, self.engram.layer_hash_index],
+                        engram_mask,
+                    )
                 post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                     residual,
                     self.hc_attn_fn,
