@@ -1146,8 +1146,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
         # use natural element-size pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+        # SM12x DeepGEMM needs 64 physical rows, even in C2 caches.
         return MLAAttentionSpec(
-            block_size=vllm_config.cache_config.block_size,
+            block_size=(
+                64 * max(1, self.compress_ratio)
+                if current_platform.is_device_capability_family(120)
+                else vllm_config.cache_config.block_size
+            ),
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
@@ -1217,7 +1222,11 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             576 if uses_fp8_ds_mla_layout and not _use_v41_mxfp8_kv_record() else 512
         )
         return MLAAttentionSpec(
-            block_size=self.cache_config.block_size,
+            block_size=(
+                64 * max(1, self.compress_ratio)
+                if current_platform.is_device_capability_family(120)
+                else self.cache_config.block_size
+            ),
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
