@@ -1552,6 +1552,12 @@ class Engram(nn.Module):
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         # Without sequence parallelism every TP rank holds every token, so
         # shard the output columns instead of replicating the projection.
+        # VLLM_DSV41_ENGRAM_WKV_REPLICATED=1 keeps the replicated projection:
+        # over PCIe the all-gather of the sharded output may cost more than the
+        # 7/8 of the GEMM it saves.
+        replicate = use_sequence_parallel or (
+            os.environ.get("VLLM_DSV41_ENGRAM_WKV_REPLICATED", "0") == "1"
+        )
         self.wkv = ColumnParallelLinear(
             n_hash_cols * layout.head_dim,
             self.dim * (self.hc_mult + 1),
@@ -1560,7 +1566,7 @@ class Engram(nn.Module):
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wkv",
-            disable_tp=use_sequence_parallel,
+            disable_tp=replicate,
         )
         self.q_weight = nn.Parameter(
             torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
