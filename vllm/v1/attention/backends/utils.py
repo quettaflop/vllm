@@ -264,8 +264,9 @@ def resolve_kv_cache_layout(
     """Resolve one KV cache layout for the whole model.
 
     Runs once in the engine core. Every worker reports the layouts its backends
-    support, most preferred first (``get_supported_kv_cache_layouts``); all
-    ranks run the same backends, so their lists must agree. Specs mixing HNC
+    support, most preferred first (``get_supported_kv_cache_layouts``). Ranks
+    of one pipeline stage run the same backends; stages may not, so the
+    candidates are the layouts every worker supports. Specs mixing HNC
     shapes narrow the candidates to block-compact layouts. An explicit
     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
@@ -282,10 +283,19 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
-    )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    names = supported_layouts[0]
+    if any(other != names for other in supported_layouts[1:]):
+        # Pipeline stages can run different backend sets (a DeepSeek V4.1 stage
+        # holding only kv-sharing consumers has no indexer or compressor
+        # backend), yet every worker must use one layout: keep the layouts all
+        # of them support, in the most constrained worker's order.
+        common = set.intersection(*map(set, supported_layouts))
+        names = [name for name in min(supported_layouts, key=len) if name in common]
+        if not names:
+            raise ValueError(
+                f"No KV cache layout is supported by every worker: {supported_layouts}."
+            )
+    candidates = [_layout_from_name(name) for name in names]
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of
