@@ -1490,8 +1490,18 @@ class NixlBaseConnectorWorker:
                 if base_addr in seen_base_addresses:
                     region_index = seen_base_addresses.index(base_addr)
                     assert region_mem_types[region_index] == mem_type
+                    region_was_mla = self._region_is_mla[region_index]
                     self._region_is_mla[region_index] |= is_mla_region
                     if is_mla_region:
+                        # MLA layers of different cache groups can start at the
+                        # same offset with different page sizes (DSv4.1: one
+                        # group's attention page and another group's indexer
+                        # page). The region must span the longest of them, or
+                        # the bytes past the shorter page are never transferred.
+                        if region_was_mla:
+                            block_len = max(
+                                block_len, self.block_len_per_layer[region_index]
+                            )
                         self.block_len_per_layer[region_index] = block_len
                         self.block_stride_per_layer[region_index] = block_stride
                         self.region_num_blocks[region_index] = num_blocks
