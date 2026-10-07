@@ -1245,6 +1245,9 @@ class DeepseekV4Indexer(nn.Module):
                 prefix=f"{prefix}.wk",
             )
             self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        # Set by DeepseekV4Model when a later pipeline stage mirrors this K
+        # cache: the step's wk projection is copied here to be sent downstream.
+        self.pp_kpre_capture: torch.Tensor | None = None
         self.k_cache = k_cache
 
         self.indexer_op = SparseAttnIndexer(
@@ -1286,6 +1289,9 @@ class DeepseekV4Indexer(nn.Module):
         # non-boundary tokens hold garbage latent and are skipped by the
         # store kernel.
         k_pre, _ = self.wk(latent)
+        if self.pp_kpre_capture is not None:
+            # A later pipeline stage mirrors this K cache (pp_kv_relay.py).
+            self.pp_kpre_capture[: k_pre.shape[0]].copy_(k_pre)
         indexer_k_norm_rope_store(
             k_pre,
             positions,

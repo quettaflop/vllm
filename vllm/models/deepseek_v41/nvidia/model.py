@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
@@ -76,6 +77,17 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
 )
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.platforms import current_platform
+from vllm.models.deepseek_v41.nvidia.pp_kv_relay import (
+    CAND_KEY,
+    KPRE_KEY,
+    LATENT_KEY,
+    TOPK_KEY,
+    DeepseekV4MirrorIndexK,
+    DeepseekV4MirrorKVCache,
+    StageRelay,
+    plan_stage_relays,
+    relay_tensor_shapes,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -90,6 +102,10 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+# Checkpoint name of an indexer's k_norm weight; index K mirrors on later
+# pipeline stages load it (pp_kv_relay.py).
+_INDEXER_K_NORM_RE = re.compile(r"layers\.(\d+)\.attn\.indexer\.k_norm\.weight$")
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -588,6 +604,51 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.engram_layout = EngramLayout.from_config(config)
 
+        # A pipeline stage starting inside a KV-sharing group mirrors the
+        # upstream source caches its layers read, and stages relay the state
+        # later stages need (pp_kv_relay.py). The mirrors register under the
+        # source layer names, so they must exist before the layers are built.
+        self.pp_relay: StageRelay | None = None
+        self.pp_kv_mirrors = nn.ModuleDict()
+        self.pp_k_mirrors = nn.ModuleDict()
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1:
+            bounds = [
+                get_pp_indices(config.num_hidden_layers, rank, pp_group.world_size)
+                for rank in range(pp_group.world_size)
+            ]
+            relay = plan_stage_relays(config, bounds)[pp_group.rank_in_group]
+            if relay.active:
+                if self.use_sequence_parallel:
+                    raise NotImplementedError(
+                        "DeepSeek V4.1 pipeline stages inside a KV-sharing group "
+                        "relay full-batch rows; sequence parallelism shards them."
+                    )
+                self.pp_relay = relay
+                attn_cls = _select_dsv4_attn_cls(vllm_config)
+                for source in relay.kv_mirrors:
+                    self.pp_kv_mirrors[str(source)] = DeepseekV4MirrorKVCache(
+                        vllm_config, attn_cls, source, f"{prefix}.layers.{source}.attn"
+                    )
+                for source in relay.k_mirrors:
+                    self.pp_k_mirrors[str(source)] = DeepseekV4MirrorIndexK(
+                        vllm_config,
+                        source,
+                        f"{prefix}.layers.{source}.attn.indexer.k_cache",
+                        self.pp_kv_mirrors[str(source)].rotary_emb,
+                    )
+                logger.info(
+                    "Pipeline stage %d (layers %d-%d) mirrors KV of layers %s and "
+                    "index K of layers %s; receives %s, sends %s.",
+                    pp_group.rank_in_group,
+                    bounds[pp_group.rank_in_group][0],
+                    bounds[pp_group.rank_in_group][1] - 1,
+                    relay.kv_mirrors,
+                    relay.k_mirrors,
+                    [k for k, _, _ in relay_tensor_shapes(config, relay, recv=True)],
+                    [k for k, _, _ in relay_tensor_shapes(config, relay, recv=False)],
+                )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -600,6 +661,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+
+        # Source layers whose step output a later stage mirrors write it into
+        # persistent buffers, which this stage sends on.
+        if self.pp_relay is not None:
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            for source in self.pp_relay.send_latents:
+                if self.start_layer <= source < self.end_layer:
+                    self.layers[source].attn.compressor.pp_latent_capture = torch.empty(
+                        max_tokens, config.head_dim, dtype=torch.bfloat16
+                    )
+            for source in self.pp_relay.send_kpres:
+                if self.start_layer <= source < self.end_layer:
+                    self.layers[source].attn.indexer.pp_kpre_capture = torch.empty(
+                        max_tokens, config.index_head_dim, dtype=torch.bfloat16
+                    )
 
         # Decoder-side SWA bounded replay: in eager prefill steps the last KV
         # source layer's query side and FFN, and every layer after it, run on
@@ -680,20 +756,85 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        )
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        if self.pp_relay is not None:
+            for key, row, row_dtype in relay_tensor_shapes(
+                self.config, self.pp_relay, recv=True
+            ):
+                tensors[key] = torch.zeros(
+                    (batch_size, *row), dtype=row_dtype, device=device
+                )
+        return IntermediateTensors(tensors)
+
+    def _pp_relay_in(
+        self, intermediate_tensors: IntermediateTensors, positions: torch.Tensor
+    ) -> None:
+        """Take this step's relayed rows: shared top-k / candidate buffers, and
+        the upstream sources' latents into the local mirror caches."""
+        relay = self.pp_relay
+        assert relay is not None
+        num_tokens = positions.shape[0]
+        if relay.recv_topk:
+            self.topk_indices_buffer[:num_tokens].copy_(intermediate_tensors[TOPK_KEY])
+        if relay.recv_cand:
+            assert self.candidate_block_buffer is not None
+            self.candidate_block_buffer[:num_tokens].copy_(
+                intermediate_tensors[CAND_KEY]
+            )
+        if not is_forward_context_available():
+            return
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            # Profile run: no KV cache bound yet.
+            return
+        for source, mirror in self.pp_kv_mirrors.items():
+            mirror.write(
+                intermediate_tensors[LATENT_KEY.format(source)], positions, attn_metadata
+            )
+        for source, mirror in self.pp_k_mirrors.items():
+            mirror.write(
+                intermediate_tensors[KPRE_KEY.format(source)], positions, attn_metadata
+            )
+
+    def _pp_relay_out(
+        self, intermediate_tensors: IntermediateTensors | None, num_tokens: int
+    ) -> dict[str, torch.Tensor]:
+        """Rows the next stage needs: produced here or passed through."""
+        relay = self.pp_relay
+        assert relay is not None
+        out: dict[str, torch.Tensor] = {}
+        for source in relay.send_latents:
+            key = LATENT_KEY.format(source)
+            if self.start_layer <= source < self.end_layer:
+                capture = self.layers[source].attn.compressor.pp_latent_capture
+                out[key] = capture[:num_tokens]
+            else:
+                assert intermediate_tensors is not None
+                out[key] = intermediate_tensors[key]
+        for source in relay.send_kpres:
+            key = KPRE_KEY.format(source)
+            if self.start_layer <= source < self.end_layer:
+                out[key] = self.layers[source].attn.indexer.pp_kpre_capture[:num_tokens]
+            else:
+                assert intermediate_tensors is not None
+                out[key] = intermediate_tensors[key]
+        if relay.send_topk:
+            out[TOPK_KEY] = self.topk_indices_buffer[:num_tokens]
+        if relay.send_cand:
+            assert self.candidate_block_buffer is not None
+            out[CAND_KEY] = self.candidate_block_buffer[:num_tokens]
+        return out
 
     def forward(
         self,
@@ -791,6 +932,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if not get_pp_group().is_first_rank:
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
+            if self.pp_relay is not None:
+                self._pp_relay_in(intermediate_tensors, positions)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         replay = self.decoder_replay_layers
@@ -841,13 +984,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ]
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "pre_mix": pre_mix,
-                    **self.pack_local_aux_hidden_states(aux_hidden_states),
-                }
-            )
+            tensors = {
+                "hidden_states": hidden_states,
+                "pre_mix": pre_mix,
+                **self.pack_local_aux_hidden_states(aux_hidden_states),
+            }
+            if self.pp_relay is not None:
+                tensors.update(
+                    self._pp_relay_out(intermediate_tensors, full_num_tokens)
+                )
+            return IntermediateTensors(tensors)
         aux_hidden_states = remote_aux + aux_hidden_states
 
         # MTP needs full HC states; otherwise collapse and normalize locally
@@ -1102,6 +1248,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
         for name, loaded_weight in weights:
+            # The source layer is not on this stage, but its index K mirror
+            # needs the indexer's k_norm weight.
+            if self.pp_k_mirrors and (
+                match := _INDEXER_K_NORM_RE.search(name)
+            ) and match.group(1) in self.pp_k_mirrors:
+                self.pp_k_mirrors[match.group(1)].k_norm_weight.copy_(loaded_weight)
+                continue
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)

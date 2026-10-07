@@ -241,6 +241,11 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
+        # Set by DeepseekV4Model when a later pipeline stage mirrors this
+        # layer's cache (pp_kv_relay.py): the latent is written here instead of
+        # a fresh tensor, so the stage can send this step's rows downstream.
+        self.pp_latent_capture: torch.Tensor | None = None
+
         # Save reference to static_forward_context for forward-time KV cache lookup.
         # get_current_vllm_config() is only available during __init__, not forward.
         self._static_forward_context = (
@@ -274,12 +279,15 @@ class DeepseekCompressor(nn.Module):
             query_start_loc = state_metadata.query_start_loc
             token_to_req_indices = state_metadata.token_to_req_indices
 
-        latent = torch.empty(
-            kv_score.shape[0],
-            self.head_dim,
-            dtype=torch.bfloat16,
-            device=kv_score.device,
-        )
+        if self.pp_latent_capture is not None:
+            latent = self.pp_latent_capture[: kv_score.shape[0]]
+        else:
+            latent = torch.empty(
+                kv_score.shape[0],
+                self.head_dim,
+                dtype=torch.bfloat16,
+                device=kv_score.device,
+            )
         fused_save_compress_norm(
             kv_score,
             positions,
