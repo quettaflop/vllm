@@ -46,7 +46,8 @@ class AsyncScheduler(Scheduler):
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be
                 # scheduled for decode (for PP microbatching).
-                request.next_decode_eligible_step = self.current_step + self.pp_size
+                interval = 1 if self._uses_pp_readiness(request) else self.pp_size
+                request.next_decode_eligible_step = self.current_step + interval
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False

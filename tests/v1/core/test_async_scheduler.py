@@ -558,6 +558,59 @@ def _assert_ordered_subset(delivered: list[int], emitted: list[int]) -> None:
         assert token in it, f"token {token} delivered out of order or twice"
 
 
+@pytest.mark.parametrize("num_spec", [0, 3])
+def test_pp_ready_requests_wait_for_output_then_merge(num_spec):
+    scheduler = _create_async_pp_scheduler(num_spec, pp_size=4, num_blocks=100)
+    scheduler.pp_ready_rebatch = True
+    first, second = create_requests(num_requests=2, max_tokens=32)
+    scheduler.add_request(first)
+    a = scheduler.schedule()
+    scheduler.add_request(second)
+    b = scheduler.schedule()
+    # Crossing the old cadence must not reschedule an unresolved request.
+    for _ in range(5):
+        assert not scheduler.schedule().num_scheduled_tokens
+    scheduler.update_from_output(a, _make_model_runner_output(a))
+    scheduler.update_from_output(b, _make_model_runner_output(b))
+    merged = scheduler.schedule()
+    assert set(merged.num_scheduled_tokens) == {first.request_id, second.request_id}
+    assert not scheduler.schedule().num_scheduled_tokens
+    # Reject every draft, retaining only the bonus sample. Rejections must also
+    # clear the readiness fence, not leave the request permanently blocked.
+    scheduler.update_from_output(merged, _make_model_runner_output(merged))
+    assert first.num_output_placeholders == second.num_output_placeholders == 0
+    assert set(scheduler.schedule().num_scheduled_tokens) == {
+        first.request_id,
+        second.request_id,
+    }
+
+
+@pytest.mark.parametrize("kind", ["logprobs", "prompt_logprobs", "structured"])
+def test_pp_ready_sensitive_outputs_keep_cadence(kind):
+    scheduler = _create_async_pp_scheduler(0, pp_size=4, num_blocks=100)
+    scheduler.pp_ready_rebatch = True
+    (request,) = create_requests(num_requests=1, max_tokens=32)
+    if kind == "structured":
+        request.structured_output_request = Mock()
+    else:
+        setattr(request.sampling_params, kind, 1)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert request.next_decode_eligible_step == scheduler.current_step + 4
+    for _ in range(3):
+        assert not scheduler.schedule().num_scheduled_tokens
+    assert request.request_id in scheduler.schedule().num_scheduled_tokens
+
+
+def test_pp_ready_flag_preserves_non_pp_async_overlap(monkeypatch):
+    monkeypatch.setenv("VLLM_PP_READY_REBATCH", "1")
+    scheduler = create_scheduler(async_scheduling=True, use_v2_model_runner=True)
+    (request,) = create_requests(num_requests=1, max_tokens=32)
+    scheduler.add_request(request)
+    assert scheduler.schedule().num_scheduled_tokens
+    assert scheduler.schedule().num_scheduled_tokens
+
+
 def _assert_positions_consistent(req, engine: PipelinedEngine) -> None:
     """The i-th delivered output token must be one the runner sampled for
     exactly sequence position prompt_len + i: catches a preempted request's

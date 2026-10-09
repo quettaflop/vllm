@@ -586,6 +586,16 @@ class VllmConfig:
         return bool(mm_config and mm_config.mm_encoder_only)
 
     @property
+    def pp_ready_rebatch(self) -> bool:
+        return bool(
+            envs.VLLM_PP_READY_REBATCH
+            and self.parallel_config.pipeline_parallel_size > 1
+            and self.use_v2_model_runner
+            and self.scheduler_config.async_scheduling
+            and not self.is_mm_encoder_only
+        )
+
+    @property
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.

@@ -363,6 +363,7 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        self.pp_ready_rebatch = vllm_config.pp_ready_rebatch
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -671,6 +672,10 @@ class Scheduler(SchedulerInterface):
             if self.current_step < request.next_decode_eligible_step:
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
                 # to match worker-side sampled-tokens broadcast slot ring cadence.
+                req_index += 1
+                continue
+
+            if self._uses_pp_readiness(request) and request.num_output_placeholders > 0:
                 req_index += 1
                 continue
 
@@ -1590,6 +1595,16 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+
+    def _uses_pp_readiness(self, request: Request) -> bool:
+        params = request.sampling_params
+        return (
+            self.pp_ready_rebatch
+            and not request.use_structured_output
+            and params is not None
+            and params.logprobs is None
+            and params.prompt_logprobs is None
+        )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER

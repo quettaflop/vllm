@@ -335,11 +335,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
-                ready_rebatch=bool(
-                    envs.VLLM_PP_READY_REBATCH
-                    and self.vllm_config.scheduler_config.async_scheduling
-                    and not self.vllm_config.is_mm_encoder_only
-                ),
+                ready_rebatch=self.vllm_config.pp_ready_rebatch,
             )
 
         # Samplers and decode_query_len created in load_model() after
