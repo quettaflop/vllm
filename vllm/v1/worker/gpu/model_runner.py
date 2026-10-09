@@ -307,6 +307,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.step_timing = StepTimingCollector()
+        self.pp_trace = None
+        if self.use_pp and envs.VLLM_PP_TRACE:
+            from vllm.v1.worker.gpu.pp_trace import PPTrace
+
+            self.pp_trace = PPTrace()
 
         # General request states.
         self.req_states = RequestState(
@@ -1640,7 +1645,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Update the request states.
+            if self.pp_trace is not None:
+                self.pp_trace.begin(scheduler_output)
             self.update_pp_decode_requests()
+            if self.pp_trace is not None:
+                self.pp_trace.mark("tokens_applied")
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
@@ -1901,6 +1910,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # Run model.
+        if not dummy_run and self.pp_trace is not None:
+            self.pp_trace.mark("model_start")
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -1951,6 +1962,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if not dummy_run and self.pp_trace is not None:
+            self.pp_trace.mark("model_end")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2022,6 +2035,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
             all_decode_next = self.pp_handler.receive(input_batch)
+            if self.pp_trace is not None:
+                self.pp_trace.mark("recv_done", self.pp_handler.broadcast_stream)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
@@ -2051,6 +2066,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if self.pp_trace is not None:
+            self.pp_trace.mark("sample_done")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2060,6 +2077,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_rejected,
                 input_batch,
             )
+            if self.pp_trace is not None:
+                self.pp_trace.mark("sample_broadcast", self.pp_handler.broadcast_stream)
 
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
@@ -2172,9 +2191,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.draft_tokens[input_batch.idx_mapping],
             )
             if self.pp_handler is not None:
+                if self.pp_trace is not None:
+                    self.pp_trace.mark("draft_done")
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch
                 )
+                if self.pp_trace is not None:
+                    self.pp_trace.mark(
+                        "draft_broadcast", self.pp_handler.broadcast_stream
+                    )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)

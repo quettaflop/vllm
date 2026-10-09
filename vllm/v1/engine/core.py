@@ -208,6 +208,14 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
+        self._pp_trace_steps: dict[int, tuple[int, int, int]] | None = None
+        self._pp_trace_step = 0
+        if (
+            envs.VLLM_PP_TRACE
+            and vllm_config.use_v2_model_runner
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            self._pp_trace_steps = {}
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -656,6 +664,13 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if self._pp_trace_steps is not None:
+                self._pp_trace_step += 1
+                self._pp_trace_steps[id(scheduler_output)] = (
+                    self._pp_trace_step,
+                    time.monotonic_ns(),
+                    len(batch_queue),
+                )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -717,6 +732,21 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+        if self._pp_trace_steps is not None:
+            trace_step, dispatch_ns, queue_depth = self._pp_trace_steps.pop(
+                id(scheduler_output)
+            )
+            logger.info(
+                "PP_TRACE step=%d dispatch_ns=%d output_ns=%d queue_depth=%d "
+                "num_reqs=%d num_tokens=%d",
+                trace_step,
+                dispatch_ns,
+                time.monotonic_ns(),
+                queue_depth,
+                len(scheduler_output.num_scheduled_tokens),
+                scheduler_output.total_num_scheduled_tokens,
+            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
