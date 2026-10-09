@@ -626,7 +626,10 @@ def _assert_positions_consistent(req, engine: PipelinedEngine) -> None:
 
 
 @pytest.mark.parametrize("num_spec", [0, 3])
-def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
+@pytest.mark.parametrize("ready_rebatch", [False, True])
+def test_kv_pressure_preemption_with_inflight_output(
+    num_spec: int, ready_rebatch: bool
+):
     """KV-pressure preemption of requests with in-flight async output.
 
     PP=3 + async scheduling (batch queue of 4), a block pool small enough
@@ -643,6 +646,7 @@ def test_kv_pressure_preemption_with_inflight_output(num_spec: int):
     """
     max_tokens = 24
     scheduler = _create_async_pp_scheduler(num_spec)
+    scheduler.pp_ready_rebatch = ready_rebatch
     requests = create_requests(
         num_requests=8, num_tokens=8, max_tokens=max_tokens, ignore_eos=True
     )

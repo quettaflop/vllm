@@ -170,3 +170,22 @@ def test_ready_delivery_excludes_non_final_prefill_rows(ready_handler):
     outputs = handler.get_ready_sampled_outputs([1])
     assert outputs[0]["idx_mapping"].tolist() == [1]
     assert outputs[0]["sampled_tokens"].tolist() == [[20, -1, -1]]
+
+
+def test_ready_delivery_updates_persistent_drafts_before_graph_replay(ready_handler):
+    """A captured forward must see current drafts after request rows regroup."""
+    handler, receive = ready_handler
+    drafts = torch.full((8, 2), -1, dtype=torch.int64, device="cuda")
+    observed = torch.empty_like(drafts)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        observed.copy_(drafts)
+    for indices, values in [
+        ([0, 1], [[11, 12], [21, 22]]),
+        ([1, 0], [[31, 32], [41, 42]]),
+    ]:
+        handler.get_ready_sampled_outputs([])
+        receive(indices, [[1, -1, -1]] * 2, [1, 1], [2, 2], values)
+        handler.get_ready_sampled_outputs(indices, drafts)
+        graph.replay()
+        assert observed[indices].tolist() == values
