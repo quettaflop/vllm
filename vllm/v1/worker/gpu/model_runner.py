@@ -335,6 +335,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                ready_rebatch=bool(
+                    envs.VLLM_PP_READY_REBATCH
+                    and self.vllm_config.scheduler_config.async_scheduling
+                    and not self.vllm_config.is_mm_encoder_only
+                ),
             )
 
         # Samplers and decode_query_len created in load_model() after
@@ -1112,10 +1117,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for mm_hash in scheduler_output.free_encoder_mm_hashes:
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
-    def update_pp_decode_requests(self):
+    def update_pp_decode_requests(
+        self, scheduler_output: SchedulerOutput | None = None
+    ):
         # For non-last PP ranks, update decode requests with sampler output from
-        # the prior step in which they were scheduled (pp_size steps ago).
+        # the prior step in which they were scheduled.
         if self.pp_handler is not None:
+            if self.pp_handler.ready_rebatch:
+                assert scheduler_output is not None
+                req_indices = [
+                    self.req_states.req_id_to_index[req_id]
+                    for req_id in scheduler_output.num_scheduled_tokens
+                    if req_id in self.req_states.req_id_to_index
+                ]
+                for ready_outputs in self.pp_handler.get_ready_sampled_outputs(
+                    req_indices, self.req_states.draft_tokens
+                ):
+                    self.postprocess_sampled(**ready_outputs)
+                return
             outputs = self.pp_handler.get_prev_sampled_outputs(
                 self.req_states.draft_tokens
             )
@@ -1647,10 +1666,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Update the request states.
             if self.pp_trace is not None:
                 self.pp_trace.begin(scheduler_output)
-            self.update_pp_decode_requests()
+            ready_rebatch = (
+                self.pp_handler is not None and self.pp_handler.ready_rebatch
+            )
+            if ready_rebatch:
+                self.finish_requests(scheduler_output)
+            self.update_pp_decode_requests(scheduler_output)
             if self.pp_trace is not None:
                 self.pp_trace.mark("tokens_applied")
-            self.finish_requests(scheduler_output)
+            if not ready_rebatch:
+                self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)

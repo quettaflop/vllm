@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_PP_TRACE: bool = False
+    VLLM_PP_READY_REBATCH: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -864,6 +865,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     "VLLM_PP_TRACE": lambda: bool(int(os.getenv("VLLM_PP_TRACE", "0"))),
+    "VLLM_PP_READY_REBATCH": lambda: bool(int(os.getenv("VLLM_PP_READY_REBATCH", "0"))),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (

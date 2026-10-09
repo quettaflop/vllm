@@ -50,7 +50,8 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
 class PPHandler:
     """Runs the PP sampled-token broadcast/recv on a side stream so the
     default stream isn't gated by the matching peer call. Step T's recv is
-    consumed at step T+pp_size via `get_prev_sampled_outputs`.
+    consumed at step T+pp_size via `get_prev_sampled_outputs`, or by request
+    when ready-driven rebatching is enabled.
 
     Uses a dedicated NCCL communicator (sibling of the PP `device_group`)
     for the broadcast so it does not serialize on the wire with the
@@ -58,7 +59,11 @@ class PPHandler:
     """
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        ready_rebatch: bool = False,
     ):
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
@@ -67,6 +72,12 @@ class PPHandler:
         self.device = device
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
+        self.ready_rebatch = (
+            ready_rebatch and not self.is_last_rank and get_pp_group().world_size > 1
+        )
+        self._step_id = 0
+        self._pending_steps: dict[int, PendingRecv] = {}
+        self._pending_requests: dict[int, tuple[int, int]] = {}
 
         # On non-last ranks, a FIFO with one entry per in-flight step: the entry
         # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
@@ -89,6 +100,58 @@ class PPHandler:
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
+        if pending := self._pending_requests.pop(req_idx, None):
+            step_id, row = pending
+            slot = self._pending_steps[step_id]
+            slot.need_sampled_mask[row] = False
+            if not slot.need_sampled_mask.any():
+                del self._pending_steps[step_id]
+
+    def get_ready_sampled_outputs(
+        self,
+        req_indices: list[int],
+        draft_tokens_to_update: torch.Tensor | None = None,
+    ) -> list[dict[str, torch.Tensor]]:
+        """Consume each scheduled request's preceding sample exactly once."""
+        assert self.ready_rebatch
+        self._step_id += 1
+        rows_by_step: dict[int, list[int]] = {}
+        for req_idx in req_indices:
+            pending = self._pending_requests.pop(req_idx, None)
+            if pending is not None:
+                step_id, row = pending
+                rows_by_step.setdefault(step_id, []).append(row)
+
+        outputs = []
+        for step_id, rows in sorted(rows_by_step.items()):
+            slot = self._pending_steps[step_id]
+            row_indices = np.asarray(rows, dtype=np.intp)
+            indices = slot.idx_mapping_np[row_indices]
+            valid = (
+                self.req_idx_gen_np[indices] == slot.gen_at_receive_np[row_indices]
+            ) & slot.need_sampled_mask[row_indices]
+            slot.need_sampled_mask[row_indices] = False
+            if not slot.need_sampled_mask.any():
+                del self._pending_steps[step_id]
+            if not valid.any():
+                continue
+
+            row_indices_gpu = async_tensor_h2d(row_indices[valid], device=self.device)
+            idx_mapping = async_tensor_h2d(indices[valid], device=self.device)
+            self.main_stream.wait_event(slot.event)
+            if slot.draft_tokens is not None and draft_tokens_to_update is not None:
+                draft_tokens_to_update[idx_mapping] = slot.draft_tokens.index_select(
+                    0, row_indices_gpu
+                )
+            outputs.append(
+                dict(
+                    sampled_tokens=slot.sampled_tokens.index_select(0, row_indices_gpu),
+                    num_sampled=slot.num_sampled.index_select(0, row_indices_gpu),
+                    num_rejected=slot.num_rejected.index_select(0, row_indices_gpu),
+                    idx_mapping=idx_mapping,
+                )
+            )
+        return outputs
 
     def configure_aux_hidden_state_relay(self, model: torch.nn.Module) -> None:
         from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -222,7 +285,7 @@ class PPHandler:
             combined.record_stream(self.main_stream)
             if draft_tokens is not None:
                 draft_tokens.record_stream(self.main_stream)
-        self.queue[-1] = PendingRecv(
+        slot = PendingRecv(
             event,
             sampled_tokens,
             num_sampled,
@@ -233,6 +296,14 @@ class PPHandler:
             gen_at_receive_np,
             draft_tokens,
         )
+        if self.ready_rebatch:
+            self._pending_steps[self._step_id] = slot
+            for row in np.flatnonzero(need_sampled_mask):
+                req_idx = int(input_batch.idx_mapping_np[row])
+                assert req_idx not in self._pending_requests
+                self._pending_requests[req_idx] = self._step_id, int(row)
+        else:
+            self.queue[-1] = slot
         return bool(need_sampled_mask.all())
 
     def broadcast(
