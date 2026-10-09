@@ -2,12 +2,43 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import weakref
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from vllm.v1.executor.multiproc_executor import WorkerProc
+from vllm.v1.executor.multiproc_executor import FutureWrapper, WorkerProc
+
+
+def test_future_poll_preserves_rpc_order_without_waiting():
+    replies: deque[str] = deque()
+    futures: deque[FutureWrapper] = deque()
+    first = FutureWrapper(
+        futures, replies.popleft, response_ready=lambda: bool(replies)
+    )
+    second = FutureWrapper(
+        futures, replies.popleft, response_ready=lambda: bool(replies)
+    )
+    assert not second.poll()
+    replies.append("execute")
+    assert not second.poll()
+    assert first.result() == "execute"
+    replies.append("sample")
+    assert second.poll()
+    assert second.result() == "sample"
+    assert not futures
+    assert second.poll()
+
+
+def test_future_poll_preserves_worker_exception():
+    def fail():
+        raise RuntimeError("worker failure")
+
+    future = FutureWrapper(deque(), fail, response_ready=lambda: True)
+    assert future.poll()
+    with pytest.raises(RuntimeError, match="worker failure"):
+        future.result()
 
 
 class _ExitWorkerLoop(RuntimeError):

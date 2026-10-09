@@ -244,6 +244,7 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        self.pp_ready_rebatch = vllm_config.pp_ready_rebatch
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -662,7 +663,15 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # Publish all already-completed outputs before scheduling again, so
+        # their ready requests can join the same batch. Keep one output per
+        # engine iteration to preserve per-step statistics and client delivery.
+        drain_ready = (
+            self.pp_ready_rebatch
+            and bool(batch_queue)
+            and self.model_executor.has_ready_output(batch_queue[-1][0])
+        )
+        if not drain_ready and self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             if self._pp_trace_steps is not None:
                 self._pp_trace_step += 1
@@ -1501,7 +1510,11 @@ class EngineCoreProc(EngineCore):
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
-        if not model_executed and self.scheduler.has_requests():
+        if (
+            not model_executed
+            and self.scheduler.has_requests()
+            and not (self.pp_ready_rebatch and outputs is not None)
+        ):
             time.sleep(0.001)
 
         return model_executed

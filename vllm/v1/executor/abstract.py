@@ -211,6 +211,10 @@ class Executor(ABC):
     ):
         raise NotImplementedError
 
+    def has_ready_output(self, future: Future) -> bool:
+        """Poll completion without waiting for worker output."""
+        return future.done()
+
     def get_kv_connector_handshake_metadata(
         self,
     ) -> list[dict[tuple[int, int], KVConnectorHandshakeMetadata]]:

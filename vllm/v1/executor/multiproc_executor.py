@@ -81,10 +81,12 @@ class FutureWrapper(Future):
         futures_queue: deque["FutureWrapper"],
         get_response: Callable[[], Any],
         aggregate: Callable = lambda x: x,
+        response_ready: Callable[[], bool] | None = None,
     ):
         self.futures_queue = futures_queue
         self.get_response = get_response
         self.aggregate = aggregate
+        self.response_ready = response_ready
         super().__init__()
         self.futures_queue.appendleft(self)
 
@@ -97,6 +99,16 @@ class FutureWrapper(Future):
             future = self.futures_queue.pop()
             future._wait_for_response()
         return super().result()
+
+    def poll(self) -> bool:
+        """Resolve available RPC replies in order, without waiting for workers."""
+        while not self.done() and self.futures_queue:
+            future = self.futures_queue[-1]
+            if future.response_ready is None or not future.response_ready():
+                break
+            self.futures_queue.pop()
+            future._wait_for_response()
+        return self.done()
 
     def _wait_for_response(self):
         try:
@@ -442,10 +454,20 @@ class MultiprocExecutor(Executor):
             return responses[0] if output_rank is not None else responses
 
         future = FutureWrapper(
-            self.futures_queue, get_response=get_response, aggregate=aggregate
+            self.futures_queue,
+            get_response=get_response,
+            aggregate=aggregate,
+            response_ready=(lambda: all(mq.can_dequeue() for mq in response_mqs))
+            if self.vllm_config.pp_ready_rebatch
+            else None,
         )
 
         return future if non_block else future.result()
+
+    def has_ready_output(self, future: Future) -> bool:
+        if isinstance(future, FutureWrapper):
+            return future.poll()
+        return future.done()
 
     @staticmethod
     def _ensure_worker_termination(worker_procs: list[BaseProcess]):

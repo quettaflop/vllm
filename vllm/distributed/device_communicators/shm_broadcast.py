@@ -879,6 +879,26 @@ class MessageQueue:
         if self.n_remote_reader > 0:
             self.remote_socket.send_multipart(all_buffers, copy=False)
 
+    def can_dequeue(self) -> bool:
+        """Check the next message without consuming it or waiting for a writer.
+
+        A local slot remains owned by the reader until dequeue acknowledges it.
+        Overflow messages also need their socket payload before dequeue is safe.
+        Like dequeue, this must be called by the queue's sole consuming thread.
+        """
+        if self._is_local_reader:
+            with self.buffer.get_metadata(self.current_idx) as metadata:
+                memory_fence()
+                if not metadata[0] or metadata[self.local_reader_rank + 1]:
+                    return False
+            with self.buffer.get_data(self.current_idx) as buf:
+                if buf[0] != 1:
+                    return True
+            return bool(self.local_socket.poll(timeout=0))
+        if self._is_remote_reader:
+            return bool(self.remote_socket.poll(timeout=0))
+        raise RuntimeError("Only readers can dequeue")
+
     def dequeue(
         self,
         timeout: float | None = None,

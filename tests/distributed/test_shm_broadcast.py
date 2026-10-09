@@ -36,6 +36,42 @@ def get_arrays(n: int, seed: int = 0) -> list[np.ndarray]:
     return [np.random.randint(1, 100, i) for i in sizes]
 
 
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("size", [16, 4096])
+def test_can_dequeue_does_not_consume(remote, size):
+    """Peeking must neither acknowledge a slot nor lose an overflow payload."""
+    writer = MessageQueue(
+        1,
+        0 if remote else 1,
+        max_chunk_bytes=1024,
+        max_chunks=2,
+        connect_ip="127.0.0.1",
+    )
+    reader = MessageQueue.create_from_handle(writer.export_handle(), 0)
+    ready = threading.Thread(target=writer.wait_until_ready, daemon=True)
+    ready.start()
+    reader.wait_until_ready()
+    ready.join(timeout=5)
+    assert not ready.is_alive()
+    try:
+        assert not reader.can_dequeue()
+        for i in range(5):
+            payload = bytes([i]) * size
+            writer.enqueue(payload)
+            deadline = time.monotonic() + 5
+            while not reader.can_dequeue():
+                assert time.monotonic() < deadline
+                time.sleep(0.001)
+            index = reader.current_idx
+            assert reader.can_dequeue()
+            assert reader.current_idx == index
+            assert reader.dequeue(timeout=1) == payload
+            assert not reader.can_dequeue()
+    finally:
+        reader.shutdown()
+        writer.shutdown()
+
+
 def distributed_run(fn, world_size, timeout=60):
     """Run a function in multiple processes with proper error handling.
 
