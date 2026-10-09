@@ -642,7 +642,8 @@ class EngineCore:
         """Schedule and execute batches with the batch queue.
         Note that if nothing to output in this step, None is returned.
 
-        The execution flow is as follows:
+        Ready rebatching drains completed outputs before scheduling so their
+        requests can merge. Otherwise, the execution flow is as follows:
         1. Try to schedule a new batch if the batch queue is not full.
         If a new batch is scheduled, directly return an empty engine core
         output. In other words, fulfilling the batch queue has a higher priority
@@ -669,7 +670,10 @@ class EngineCore:
         drain_ready = (
             self.pp_ready_rebatch
             and bool(batch_queue)
-            and self.model_executor.has_ready_output(batch_queue[-1][0])
+            and (
+                self.scheduler.should_defer_pp_rebatch()
+                or self.model_executor.has_ready_output(batch_queue[-1][0])
+            )
         )
         if not drain_ready and self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())

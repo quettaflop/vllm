@@ -50,6 +50,10 @@ class SchedulerInterface(ABC):
     ) -> None:
         raise NotImplementedError
 
+    def should_defer_pp_rebatch(self) -> bool:
+        """Whether to consume another pending output before scheduling decode."""
+        return False
+
     @abstractmethod
     def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.

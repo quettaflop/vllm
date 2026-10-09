@@ -10,20 +10,26 @@ from unittest.mock import Mock
 import pytest
 
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.executor.multiproc_executor import FutureWrapper
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_completed_batches_drain_before_rescheduling(enabled):
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_completed_batches_drain_before_rescheduling(enabled, coalesce):
     """Ready groups merge only after every available output reaches scheduling."""
     queue: deque[tuple[Future[int], str, Future[int]]] = deque()
     outputs = []
     for i in range(2):
         future: Future[int] = Future()
-        future.set_result(i)
+        if coalesce:
+            future = FutureWrapper(deque(), lambda i=i: i, response_ready=lambda: False)
+        else:
+            future.set_result(i)
         queue.appendleft((future, f"batch{i}", future))
         outputs.append({i: object()})
     pending: Future[None] = Future()
     scheduler = Mock()
+    scheduler.should_defer_pp_rebatch.return_value = coalesce
     scheduler.schedule.return_value = SimpleNamespace(total_num_scheduled_tokens=0)
     scheduler.update_from_output.side_effect = outputs
     executor = Mock()

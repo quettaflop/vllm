@@ -18,6 +18,19 @@ from vllm.envs import (
 from vllm.exceptions import VLLMValidationError
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "VLLM_PP_TRACE",
+        "VLLM_PP_READY_REBATCH",
+        "VLLM_PP_REBATCH_MIN_FRACTION",
+    ],
+)
+def test_pp_dispatch_flags_do_not_invalidate_compile_cache(monkeypatch, name):
+    monkeypatch.setenv(name, "1")
+    assert name not in envs.compile_factors()
+
+
 def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
     assert envs.VLLM_HOST_IP == ""
     assert envs.VLLM_PORT is None

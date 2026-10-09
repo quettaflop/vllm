@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -364,6 +365,11 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self.pp_ready_rebatch = vllm_config.pp_ready_rebatch
+        self.pp_rebatch_min_fraction = (
+            envs.VLLM_PP_REBATCH_MIN_FRACTION if self.pp_ready_rebatch else 0.0
+        )
+        if not 0.0 <= self.pp_rebatch_min_fraction <= 1.0:
+            raise ValueError("VLLM_PP_REBATCH_MIN_FRACTION must be between 0 and 1")
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -670,8 +676,8 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if self.current_step < request.next_decode_eligible_step:
-                # V2+PP+async: enforce `pp_size` steps between same-req decodes
-                # to match worker-side sampled-tokens broadcast slot ring cadence.
+                # V2 async PP uses pp_size in cadence mode, or one step plus
+                # the output-readiness fence below with request-keyed delivery.
                 req_index += 1
                 continue
 
@@ -1595,6 +1601,24 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+
+    def should_defer_pp_rebatch(self) -> bool:
+        # Only coalesce established decode cohorts. New arrivals, prefills,
+        # frees and sensitive-output requests keep their normal progress path.
+        if (
+            not self.pp_ready_rebatch
+            or self.pp_rebatch_min_fraction == 0
+            or len(self.running) < 2
+            or self.waiting
+            or self.finished_req_ids
+        ):
+            return False
+        if any(
+            r.is_prefill_chunk or not self._uses_pp_readiness(r) for r in self.running
+        ):
+            return False
+        ready = sum(r.num_output_placeholders == 0 for r in self.running)
+        return ready < self.pp_rebatch_min_fraction * len(self.running)
 
     def _uses_pp_readiness(self, request: Request) -> bool:
         params = request.sampling_params

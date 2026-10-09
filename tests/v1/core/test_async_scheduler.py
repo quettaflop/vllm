@@ -611,6 +611,51 @@ def test_pp_ready_flag_preserves_non_pp_async_overlap(monkeypatch):
     assert scheduler.schedule().num_scheduled_tokens
 
 
+@pytest.mark.parametrize(
+    "fraction, defer", [(0, False), (0.5, False), (0.75, True), (1, True)]
+)
+def test_pp_coalescing_waits_for_enough_decode_outputs(fraction, defer):
+    scheduler = _create_async_pp_scheduler(3, pp_size=4, num_blocks=100)
+    scheduler.pp_ready_rebatch = True
+    scheduler.pp_rebatch_min_fraction = fraction
+    requests = create_requests(num_requests=4, max_tokens=32)
+    for request in requests[:2]:
+        scheduler.add_request(request)
+    first = scheduler.schedule()
+    for request in requests[2:]:
+        scheduler.add_request(request)
+    second = scheduler.schedule()
+    scheduler.update_from_output(first, _make_model_runner_output(first))
+    assert scheduler.should_defer_pp_rebatch() == defer
+    scheduler.update_from_output(second, _make_model_runner_output(second))
+    assert not scheduler.should_defer_pp_rebatch()
+    assert len(scheduler.schedule().num_scheduled_tokens) == 4
+
+
+@pytest.mark.parametrize("progress", ["arrival", "prefill", "free", "logprobs"])
+def test_pp_coalescing_does_not_hold_other_progress(progress):
+    scheduler = _create_async_pp_scheduler(3, pp_size=4, num_blocks=100)
+    scheduler.pp_ready_rebatch = True
+    scheduler.pp_rebatch_min_fraction = 1.0
+    requests = create_requests(num_requests=2, max_tokens=32)
+    for request in requests:
+        scheduler.add_request(request)
+    scheduler.schedule()
+    assert scheduler.should_defer_pp_rebatch()
+    if progress in ("arrival", "prefill"):
+        (arrival,) = create_requests(num_requests=1, num_tokens=1024, req_ids=["new"])
+        scheduler.add_request(arrival)
+        if progress == "prefill":
+            scheduler.schedule()
+    elif progress == "free":
+        scheduler.finish_requests(
+            requests[0].request_id, RequestStatus.FINISHED_ABORTED
+        )
+    else:
+        requests[0].sampling_params.logprobs = 1
+    assert not scheduler.should_defer_pp_rebatch()
+
+
 def _assert_positions_consistent(req, engine: PipelinedEngine) -> None:
     """The i-th delivered output token must be one the runner sampled for
     exactly sequence position prompt_len + i: catches a preempted request's

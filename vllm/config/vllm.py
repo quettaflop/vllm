@@ -587,6 +587,7 @@ class VllmConfig:
 
     @property
     def pp_ready_rebatch(self) -> bool:
+        """Enable the experimental PP delivery/scheduling path only as a unit."""
         return bool(
             envs.VLLM_PP_READY_REBATCH
             and self.parallel_config.pipeline_parallel_size > 1
