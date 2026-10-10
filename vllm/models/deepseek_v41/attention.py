@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, cast
 
 import regex as re
 import torch
+
+from vllm import _small_m_bf16 as small_m_bf16
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -897,6 +899,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
+                w = compressor.fused_wkv_wgate.weight
+                if small_m_bf16.supports(hidden_states, w):
+                    return small_m_bf16.mm(hidden_states, w, torch.float32)
                 return torch.mm(
                     hidden_states,
                     compressor.fused_wkv_wgate.weight.T,
@@ -909,6 +914,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
+                w = getattr(indexer.weights_proj, "weight", None)
+                if (w is not None and getattr(indexer.weights_proj, "bias", None) is None
+                        and small_m_bf16.supports(hidden_states, w)):
+                    return small_m_bf16.mm(hidden_states, w, torch.bfloat16)
                 # ReplicatedLinear returns (output, bias); bias is None.
                 weights, _ = indexer.weights_proj(hidden_states)
                 return weights

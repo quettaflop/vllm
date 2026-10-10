@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
+
+from vllm import _small_m_bf16 as small_m_bf16
 import torch.nn as nn
 
 from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
@@ -79,9 +81,12 @@ def deep_gemm_fp8_o_proj(
         )
     else:
         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
-        torch.bmm(
-            o_proj_input.transpose(0, 1),
-            grouped_weight.transpose(1, 2),
-            out=z.transpose(0, 1),
-        )
+        if small_m_bf16.supports_grouped(o_proj_input, grouped_weight):
+            small_m_bf16.grouped_into(o_proj_input, grouped_weight, z)
+        else:
+            torch.bmm(
+                o_proj_input.transpose(0, 1),
+                grouped_weight.transpose(1, 2),
+                out=z.transpose(0, 1),
+            )
     return wo_b(z.flatten(1))
