@@ -260,6 +260,9 @@ class FlashInferPcieIpcAllReduce:
         self.hidden_dim = int(hidden_dim)
         self.dtype = dtype
         self.min_tokens = int(os.environ.get("VLLM_FI_PCIE_IPC_MIN_TOKENS", "0"))
+        # VLLM_FI_PCIE_IPC_SMALL_TOKENS=N also routes all-reduces of at most N
+        # tokens (single-request decode) through IPC, below the NCCL band.
+        self.small_tokens = int(os.environ.get("VLLM_FI_PCIE_IPC_SMALL_TOKENS", "0"))
         max_numel = batches[-1] * self.hidden_dim
         workspace = flashinfer_comm.PcieIpcAllReduceWorkspace(
             group=self.group,
@@ -316,7 +319,7 @@ class FlashInferPcieIpcAllReduce:
             and inp.is_cuda
             and inp.is_contiguous()
             and inp.dim() == 2
-            and inp.shape[0] >= self.min_tokens
+            and (inp.shape[0] >= self.min_tokens or inp.shape[0] <= self.small_tokens)
             and inp.shape[1] == self.hidden_dim
             and inp.dtype == self.dtype
             and workspace.supports(inp)
