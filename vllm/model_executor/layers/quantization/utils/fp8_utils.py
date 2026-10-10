@@ -142,6 +142,7 @@ def _silu_mul_quant_fp8_packed_kernel(
     input_ptr,
     output_q_ptr,
     output_scale_ptr,
+    row_ids_ptr,
     M,
     input_stride_m,
     output_q_stride_m,
@@ -158,6 +159,7 @@ def _silu_mul_quant_fp8_packed_kernel(
     PACKS_PER_CTA: tl.constexpr,
     BLOCK_M: tl.constexpr,
     HAS_CLAMP: tl.constexpr,
+    HAS_ROW_IDS: tl.constexpr = False,
 ):
     GROUPS_PER_PACK: tl.constexpr = 4
     hidden_size: tl.constexpr = N // 2
@@ -179,70 +181,74 @@ def _silu_mul_quant_fp8_packed_kernel(
     while row_start < M:
         rows = row_start + row_offsets
         row_mask = rows < M
-        input_row_start = rows[:, None] * input_stride_m
-        output_row_start = rows[:, None] * output_q_stride_m
+        if HAS_ROW_IDS:
+            row_ids = tl.load(row_ids_ptr + rows, mask=row_mask, other=-1)
+            row_mask = row_mask & (row_ids >= 0)
+        if tl.max(row_mask.to(tl.int32), axis=0) > 0:
+            input_row_start = rows[:, None] * input_stride_m
+            output_row_start = rows[:, None] * output_q_stride_m
 
-        gate_flat = tl.load(
-            input_ptr + input_row_start + col_start + col_offsets[None, :],
-            mask=row_mask[:, None] & col_mask[None, :],
-            other=0.0,
-        )
-        up_flat = tl.load(
-            input_ptr
-            + input_row_start
-            + hidden_size
-            + col_start
-            + col_offsets[None, :],
-            mask=row_mask[:, None] & col_mask[None, :],
-            other=0.0,
-        )
+            gate_flat = tl.load(
+                input_ptr + input_row_start + col_start + col_offsets[None, :],
+                mask=row_mask[:, None] & col_mask[None, :],
+                other=0.0,
+            )
+            up_flat = tl.load(
+                input_ptr
+                + input_row_start
+                + hidden_size
+                + col_start
+                + col_offsets[None, :],
+                mask=row_mask[:, None] & col_mask[None, :],
+                other=0.0,
+            )
 
-        gate = tl.reshape(gate_flat, (BLOCK_M, groups_per_cta, GROUP_SIZE)).to(
-            tl.float32
-        )
-        up = tl.reshape(up_flat, (BLOCK_M, groups_per_cta, GROUP_SIZE)).to(tl.float32)
+            gate = tl.reshape(gate_flat, (BLOCK_M, groups_per_cta, GROUP_SIZE)).to(
+                tl.float32
+            )
+            up = tl.reshape(up_flat, (BLOCK_M, groups_per_cta, GROUP_SIZE)).to(tl.float32)
 
-        if HAS_CLAMP:
-            gate = tl.minimum(gate, clamp_limit)
-            up = tl.clamp(up, -clamp_limit, clamp_limit)
+            if HAS_CLAMP:
+                gate = tl.minimum(gate, clamp_limit)
+                up = tl.clamp(up, -clamp_limit, clamp_limit)
 
-        # Unified gated activation: silu == swigluoai with alpha=1, beta=0.
-        #   glu = gate * sigmoid(alpha * gate); y = (up + beta) * glu
-        glu = gate / (1.0 + tl.exp(-gate * alpha))
-        y = (up + beta) * glu
-        # Round through bf16 to match unfused precision path
-        y = y.to(tl.bfloat16).to(tl.float32)
+            # Unified gated activation: silu == swigluoai with alpha=1, beta=0.
+            #   glu = gate * sigmoid(alpha * gate); y = (up + beta) * glu
+            glu = gate / (1.0 + tl.exp(-gate * alpha))
+            y = (up + beta) * glu
+            # Round through bf16 to match unfused precision path
+            y = y.to(tl.bfloat16).to(tl.float32)
 
-        absmax = tl.max(tl.abs(y), axis=2)
-        scale_raw = tl.maximum(absmax / fp8_max, 1e-10)
-        exponent = tl.ceil(tl.log2(scale_raw))
-        scale = tl.math.exp2(exponent)
+            absmax = tl.max(tl.abs(y), axis=2)
+            scale_raw = tl.maximum(absmax / fp8_max, 1e-10)
+            exponent = tl.ceil(tl.log2(scale_raw))
+            scale = tl.math.exp2(exponent)
 
-        y_q = tl.clamp(y / scale[:, :, None], fp8_min, fp8_max)
+            y_q = tl.clamp(y / scale[:, :, None], fp8_min, fp8_max)
 
-        y_q_flat = tl.reshape(y_q, (BLOCK_M, elems_per_cta))
-        tl.store(
-            output_q_ptr + output_row_start + col_start + col_offsets[None, :],
-            y_q_flat.to(output_q_ptr.dtype.element_ty),
-            mask=row_mask[:, None] & col_mask[None, :],
-        )
+            y_q_flat = tl.reshape(y_q, (BLOCK_M, elems_per_cta))
+            tl.store(
+                output_q_ptr + output_row_start + col_start + col_offsets[None, :],
+                y_q_flat.to(output_q_ptr.dtype.element_ty),
+                mask=row_mask[:, None] & col_mask[None, :],
+            )
 
-        scale_byte = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.int32)
-        scale_bytes = tl.reshape(scale_byte, (BLOCK_M, PACKS_PER_CTA, GROUPS_PER_PACK))
-        shifts = tl.arange(0, GROUPS_PER_PACK) * 8
-        packed_scale = tl.sum(scale_bytes << shifts[None, None, :], axis=2)
+            scale_byte = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.int32)
+            scale_bytes = tl.reshape(scale_byte, (BLOCK_M, PACKS_PER_CTA, GROUPS_PER_PACK))
+            shifts = tl.arange(0, GROUPS_PER_PACK) * 8
+            packed_scale = tl.sum(scale_bytes << shifts[None, None, :], axis=2)
 
-        scale_pack = pack_tile * PACKS_PER_CTA + pack_offsets
-        scale_ptrs = (
-            output_scale_ptr
-            + scale_pack[None, :] * output_scale_stride_k
-            + rows[:, None]
-        )
-        tl.store(
-            scale_ptrs,
-            packed_scale,
-            mask=row_mask[:, None] & (scale_pack[None, :] < PACKS_PER_ROW),
-        )
+            scale_pack = pack_tile * PACKS_PER_CTA + pack_offsets
+            scale_ptrs = (
+                output_scale_ptr
+                + scale_pack[None, :] * output_scale_stride_k
+                + rows[:, None]
+            )
+            tl.store(
+                scale_ptrs,
+                packed_scale,
+                mask=row_mask[:, None] & (scale_pack[None, :] < PACKS_PER_ROW),
+            )
 
         row_start += row_step
 
@@ -254,12 +260,14 @@ def silu_mul_quant_fp8_packed_triton(
     clamp_limit: float | None = None,
     alpha: float = 1.0,
     beta: float = 0.0,
+    row_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert input.dim() == 2
     assert input.is_contiguous()
 
     M, N = input.shape
     hidden_size = N // 2
+    assert row_ids is None or row_ids.numel() >= M
 
     assert hidden_size % group_size == 0
 
@@ -300,6 +308,7 @@ def silu_mul_quant_fp8_packed_triton(
         input,
         output_q,
         output_scale_packed,
+        row_ids if row_ids is not None else input,
         M,
         input.stride(0),
         output_q.stride(0),
@@ -316,6 +325,7 @@ def silu_mul_quant_fp8_packed_triton(
         PACKS_PER_CTA=packs_per_cta,
         BLOCK_M=BM,
         HAS_CLAMP=has_clamp,
+        HAS_ROW_IDS=row_ids is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
