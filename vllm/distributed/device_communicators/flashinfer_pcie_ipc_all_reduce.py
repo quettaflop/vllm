@@ -14,9 +14,9 @@ leaves the group spinning, so this wrapper disables the backend group-wide
 (never on a single rank) whenever any rank cannot support it.
 """
 
+import os
 from collections.abc import Sequence
 from contextlib import contextmanager
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +53,7 @@ def _collective_disable_reason(rank_errors: Sequence[str | None]) -> str | None:
     Returns:
         None when every rank is ready, otherwise a message naming the ranks
         that failed and why.
+
     """
     failed = [
         f"rank {rank} ({error})"
@@ -87,6 +88,7 @@ def _island_placement_error(
     Returns:
         A message describing the violation, or None when the placement is
         acceptable or cannot be judged.
+
     """
     if world_size != 8 or any(node is None for node in numa_nodes):
         return None
@@ -246,8 +248,23 @@ class FlashInferPcieIpcAllReduce:
         # per new size, outside graph capture), as FlashInfer documents.
         prefill_tokens = int(os.environ.get("VLLM_FI_PCIE_IPC_PREFILL_TOKENS", "0"))
         if prefill_tokens > (batches[-1] if batches else 0):
-            ladder = [b for b in (640, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384)
-                      if (batches[-1] if batches else 0) < b < prefill_tokens]
+            ladder = [
+                b
+                for b in (
+                    640,
+                    768,
+                    1024,
+                    1536,
+                    2048,
+                    3072,
+                    4096,
+                    6144,
+                    8192,
+                    12288,
+                    16384,
+                )
+                if (batches[-1] if batches else 0) < b < prefill_tokens
+            ]
             batches = tuple(sorted(set(batches) | set(ladder) | {prefill_tokens}))
         if not batches:
             logger.warning_once(
@@ -260,6 +277,9 @@ class FlashInferPcieIpcAllReduce:
         self.hidden_dim = int(hidden_dim)
         self.dtype = dtype
         self.min_tokens = int(os.environ.get("VLLM_FI_PCIE_IPC_MIN_TOKENS", "0"))
+        # VLLM_FI_PCIE_IPC_SMALL_TOKENS=N also routes all-reduces of at most N
+        # tokens (single-request decode) through IPC, below the NCCL band.
+        self.small_tokens = int(os.environ.get("VLLM_FI_PCIE_IPC_SMALL_TOKENS", "0"))
         max_numel = batches[-1] * self.hidden_dim
         workspace = flashinfer_comm.PcieIpcAllReduceWorkspace(
             group=self.group,
@@ -287,13 +307,23 @@ class FlashInferPcieIpcAllReduce:
             # readback, which drains the GPU queue and breaks vLLM's CPU/GPU
             # overlap; eager prefill steps hit a new size almost every step.
             import time as _time
+
             t0 = _time.perf_counter()
             done = set(batches)
-            workspace.prepare([(b, self.hidden_dim) for b in range(1, prefill_tokens + 1) if b not in done],
-                              dtype=dtype)
-            logger.info_once("FlashInfer PCIe IPC: pre-resolved %d sizes up to %d tokens in %.1f s",
-                             prefill_tokens - len(done & set(range(1, prefill_tokens + 1))), prefill_tokens,
-                             _time.perf_counter() - t0)
+            workspace.prepare(
+                [
+                    (b, self.hidden_dim)
+                    for b in range(1, prefill_tokens + 1)
+                    if b not in done
+                ],
+                dtype=dtype,
+            )
+            logger.info_once(
+                "FlashInfer PCIe IPC: pre-resolved %d sizes up to %d tokens in %.1f s",
+                prefill_tokens - len(done & set(range(1, prefill_tokens + 1))),
+                prefill_tokens,
+                _time.perf_counter() - t0,
+            )
         torch.accelerator.synchronize(self.device)
         workspace.rebind_stream()
         logger.info_once(
@@ -316,7 +346,7 @@ class FlashInferPcieIpcAllReduce:
             and inp.is_cuda
             and inp.is_contiguous()
             and inp.dim() == 2
-            and inp.shape[0] >= self.min_tokens
+            and (inp.shape[0] >= self.min_tokens or inp.shape[0] <= self.small_tokens)
             and inp.shape[1] == self.hidden_dim
             and inp.dtype == self.dtype
             and workspace.supports(inp)
