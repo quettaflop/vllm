@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.moe_output import (
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 
+from . import sm120_mhc
 from .mega_mhc import (
     can_use_mega_mhc,
     mhc_shifted_post_pre_deep_gemm,
@@ -297,6 +298,32 @@ def mhc_shifted_post_pre(
             hc_post_mult_value,
             hc_sinkhorn_eps,
             sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+        return *outputs, x.new_empty(0, x.shape[1])
+
+    if (
+        pre_mix is not None
+        and norm_weight is not None
+        and sm120_mhc.supports(x, residual, capture_aux)
+    ):
+        # One fused kernel (post + delayed pre + collapse RMSNorm) instead of
+        # the two TileLang kernels.
+        outputs = sm120_mhc.mhc_shifted_post_pre(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix,
             norm_weight,
             norm_eps,
         )
