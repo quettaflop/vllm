@@ -250,6 +250,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         expert_ends: torch.Tensor | None = None,
         expert_alignment: int = 0,
+        row_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self.block_shape is not None
         block_k = self.block_shape[1]
@@ -278,6 +279,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     beta=self.gemm1_beta,
                     expert_ends=expert_ends,
                     expert_alignment=expert_alignment,
+                    row_ids=row_ids,
                 )
             act_out = torch.empty(
                 (M_sum, activation_out_dim), dtype=input.dtype, device=input.device
@@ -420,6 +422,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                 activation=activation,
                 expert_ends=grouped_layout if use_psum_layout else None,
                 expert_alignment=align_used if use_psum_layout else 0,
+                row_ids=None if use_psum_layout else grouped_layout,
             )
 
             mm2_out = _resize_cache(workspace2, (M_sum, K))
@@ -545,7 +548,11 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         return (workspace1, workspace2, output)
 
     def _act_mul_quant(
-        self, input: torch.Tensor, output: torch.Tensor, activation: MoEActivation
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        activation: MoEActivation,
+        row_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         block_k = self._ACT_BLOCK_K
         scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
@@ -561,6 +568,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                     output_q=output,
                     group_size=block_k,
                     clamp_limit=self.gemm1_clamp_limit,
+                    row_ids=row_ids,
                 )
             use_ue8m0 = scale_fmt == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
             return silu_mul_per_token_group_quant_fp8_colmajor(
@@ -666,7 +674,10 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
                 workspace13.view(dtype=torch.float8_e4m3fn), (M_sum, activation_out_dim)
             )
             a2q, a2q_scale = self._act_mul_quant(
-                input=mm1_out.view(-1, N), output=quant_out, activation=activation
+                input=mm1_out.view(-1, N),
+                output=quant_out,
+                activation=activation,
+                row_ids=expert_ids,
             )
 
             # FC2: FP8 activations x FP4 weights
