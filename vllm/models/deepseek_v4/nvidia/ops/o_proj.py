@@ -5,6 +5,7 @@ from collections.abc import Callable
 import torch
 import torch.nn as nn
 
+from vllm import _small_m_bf16 as small_m_bf16
 from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Dynamic128Sym,
@@ -95,11 +96,14 @@ def deep_gemm_fp8_o_proj(
         )
     else:
         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
-        torch.bmm(
-            o_proj_input.transpose(0, 1),
-            grouped_weight.transpose(1, 2),
-            out=z.transpose(0, 1),
-        )
+        if small_m_bf16.supports_grouped(o_proj_input, grouped_weight):
+            small_m_bf16.grouped_into(o_proj_input, grouped_weight, z)
+        else:
+            torch.bmm(
+                o_proj_input.transpose(0, 1),
+                grouped_weight.transpose(1, 2),
+                out=z.transpose(0, 1),
+            )
     return wo_b(z.flatten(1))
 
 
