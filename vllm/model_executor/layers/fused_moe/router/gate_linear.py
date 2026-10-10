@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+from vllm import _small_m_bf16 as small_m_bf16
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
@@ -228,6 +229,15 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        # Tier 0: small-M bf16 tensor-core GEMM with PDL (sm_120 decode, where
+        # cuBLAS picks sm_80 WMMA kernels).
+        if self.out_dtype in (None, torch.float32) and small_m_bf16.supports(
+            x, self.weight
+        ):
+            return small_m_bf16.mm(
+                x, self.weight, self.out_dtype or torch.bfloat16
+            ), None
+
         # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if (
             self.allow_ll_bf16_gemm
