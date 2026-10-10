@@ -76,6 +76,10 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 effort = None
             if effort is None:
                 effort = "high"
+            # The OpenAI API also allows minimal and medium, which V4.1 has no
+            # level for. Clients such as Kimi Code send medium only to mark that
+            # reasoning is on, so it keeps the default (high) rather than 400.
+            effort = {"minimal": "low", "medium": "high"}.get(effort, effort)
             if not (
                 (type(effort) is int and 1 <= effort <= 100)
                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
