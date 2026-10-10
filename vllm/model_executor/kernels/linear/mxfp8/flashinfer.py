@@ -22,6 +22,7 @@ from vllm.utils import flashinfer as vllm_flashinfer
 from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
+from . import small_m_tc
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
@@ -91,21 +92,31 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
         else:
             assert isinstance(x, torch.Tensor)
             out_dtype, input_shape = x.dtype, x.shape
+            x_2d = x.view(-1, K)
+            if small_m_tc.supports_bf16(x_2d, N, K):
+                # Quantize inside the small-M GEMM: no separate mxfp8_quantize kernel.
+                output = small_m_tc.gemm_bf16(x_2d, weight, weight_scale)
+                if bias is not None:
+                    output = output + bias
+                return output.view((*input_shape[:-1], N))
             input_mxfp8, input_scale = mxfp8_e4m3_quantize(
-                x.view(-1, K), is_sf_swizzled_layout=True
+                x_2d, is_sf_swizzled_layout=True
             )
 
         if not weight.is_contiguous():
             weight = weight.contiguous()
 
-        output = vllm_flashinfer.mm_mxfp8(
-            input_mxfp8,
-            weight.t(),
-            input_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            backend="cutlass",
-        )
+        if out_dtype == torch.bfloat16 and small_m_tc.supports(input_mxfp8.shape[0], N, K):
+            output = small_m_tc.gemm(input_mxfp8, input_scale, weight, weight_scale, out_dtype)
+        else:
+            output = vllm_flashinfer.mm_mxfp8(
+                input_mxfp8,
+                weight.t(),
+                input_scale,
+                weight_scale,
+                out_dtype=out_dtype,
+                backend="cutlass",
+            )
 
         if bias is not None:
             output = output + bias
