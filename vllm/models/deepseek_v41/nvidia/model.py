@@ -11,6 +11,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
+from vllm.config.kv_transfer import dsv41_encoder_only_boundary_layer
 from vllm.distributed import (
     get_engram_dp_size,
     get_pp_group,
@@ -76,7 +77,6 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
-from vllm.platforms import current_platform
 from vllm.models.deepseek_v41.nvidia.pp_kv_relay import (
     CAND_KEY,
     KPRE_KEY,
@@ -88,6 +88,7 @@ from vllm.models.deepseek_v41.nvidia.pp_kv_relay import (
     plan_stage_relays,
     relay_tensor_shapes,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -505,6 +506,28 @@ class DeepseekV4DecoderLayer(nn.Module):
                 previous_aux = aux
         return x, residual, post_mix, res_mix, attn_pre, previous_aux
 
+    def write_global_cache(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        engram_hashes: torch.Tensor | None = None,
+        engram_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encoder-only prefill (vllm#57872): this KV source layer's attention
+        input, then its Main KV and Indexer K only. Its query side and FFN, and
+        every later layer, run on the decode node during its SWA replay."""
+        x, *_ = self.forward_attn_input(
+            x, pre_mix, post_mix, res_mix, residual, engram_hashes, engram_mask
+        )
+        if self.use_sequence_parallel:
+            x = sp_all_gather(x)[: positions.shape[0]]
+        self.attn.write_global_cache(positions, x)
+        return x
+
     def forward_ffn(
         self,
         x: torch.Tensor,
@@ -683,8 +706,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_layers: DecoderReplayLayers | None = None
         cut = max(config.kv_source_layer_ids)
         self.decoder_replay_cut = cut
+        # Encoder-only prefill node: the stage holding the boundary (the last
+        # KV source, L20) stops after writing its global KV.
+        self.encoder_only_boundary: int | None = None
+        if vllm_config.is_dsv41_encoder_only_prefill:
+            self.encoder_only_boundary = dsv41_encoder_only_boundary_layer(config)
         if (
-            cut < self.end_layer - 1
+            self.encoder_only_boundary is None
+            and cut < self.end_layer - 1
             and self._decoder_replay_supported(vllm_config, cut)
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
         ):
@@ -800,7 +829,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             return
         for source, mirror in self.pp_kv_mirrors.items():
             mirror.write(
-                intermediate_tensors[LATENT_KEY.format(source)], positions, attn_metadata
+                intermediate_tensors[LATENT_KEY.format(source)],
+                positions,
+                attn_metadata,
             )
         for source, mirror in self.pp_k_mirrors.items():
             mirror.write(
@@ -939,6 +970,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         replay = self.decoder_replay_layers
         replays = replay is not None and replay.rows is not None
         first_end = self.decoder_replay_cut if replays else self.end_layer
+        boundary = self.encoder_only_boundary
+        cuts_here = (
+            boundary is not None and self.start_layer <= boundary < self.end_layer
+        )
+        if cuts_here:
+            assert boundary is not None and not replays
+            first_end = boundary
         # A pipeline stage that starts at the cut layer has nothing before it.
         if first_end > self.start_layer:
             hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
@@ -951,6 +989,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
                 aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
+        if cuts_here:
+            boundary_layer = self.layers[boundary]
+            assert isinstance(boundary_layer, DeepseekV4DecoderLayer)
+            return boundary_layer.write_global_cache(
+                hidden_states,
+                positions,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
                 engram_hashes,
                 engram_mask,
             )
@@ -1250,9 +1301,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         for name, loaded_weight in weights:
             # The source layer is not on this stage, but its index K mirror
             # needs the indexer's k_norm weight.
-            if self.pp_k_mirrors and (
-                match := _INDEXER_K_NORM_RE.search(name)
-            ) and match.group(1) in self.pp_k_mirrors:
+            if (
+                self.pp_k_mirrors
+                and (match := _INDEXER_K_NORM_RE.search(name))
+                and match.group(1) in self.pp_k_mirrors
+            ):
                 self.pp_k_mirrors[match.group(1)].k_norm_weight.copy_(loaded_weight)
                 continue
             if name.startswith(("vision.", "aligner.", "image_")):
