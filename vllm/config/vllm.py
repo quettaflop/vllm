@@ -2734,14 +2734,13 @@ class VllmConfig:
         if not self.use_v2_model_runner:
             raise ValueError("dsv41_encoder_only_prefill requires model runner V2.")
         pp_size = self.parallel_config.pipeline_parallel_size
-        if pp_size != 1:
-            # A pipeline-parallel producer is supported when its last stage owns
-            # the boundary (L20): earlier stages run encoder layers and relay,
-            # the last one stops after the boundary's global cache.
-            if kv_config.kv_role != "kv_producer":
-                raise ValueError(
-                    "dsv41_encoder_only_prefill requires PP=1 on the consumer."
-                )
+        # Under PP, a producer's last stage must own the boundary (L20): earlier
+        # stages run encoder layers and relay, the last one stops after the
+        # boundary's global cache. A consumer with PP replays the 128-token
+        # window through its stages like any prefix hit, and each stage pulls
+        # the global KV of the layers it holds from every producer stage
+        # (VLLM_MOONCAKE_PP_ANY_PARTITION=1 when the PP sizes match).
+        if pp_size != 1 and kv_config.kv_role == "kv_producer":
             from vllm.distributed.utils import get_pp_indices
 
             hf_text_config = model_config.hf_text_config

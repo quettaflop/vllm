@@ -389,19 +389,18 @@ def _validate_dsv41_cache_only_regions(
     producer_regions: list[TransferRegion],
     consumer_regions: list[TransferRegion],
 ) -> str | None:
-    """Encoder-only prefill (vllm#57872): the producer's global-cache regions
-    must match the consumer's for the same layers. A pipeline-parallel producer
-    stage holds a subset of the consumer's layers, so the consumer's regions
-    are compared on the producer stage's layers only."""
+    """Encoder-only prefill (vllm#57872): on the layers both sides hold, the
+    producer's global-cache regions must match the consumer's. Under pipeline
+    parallelism a producer stage and a consumer stage may share only some
+    layers, or none (that pull transfers nothing)."""
     producer_layers = Counter(
         (region.layer_name, region.layer_index) for region in producer_regions
     )
     consumer_layers = Counter(
-        (region.layer_name, region.layer_index)
-        for region in consumer_regions
-        if (region.layer_name, region.layer_index) in producer_layers
+        (region.layer_name, region.layer_index) for region in consumer_regions
     )
-    if not producer_layers or producer_layers != consumer_layers:
+    shared = producer_layers.keys() & consumer_layers.keys()
+    if any(producer_layers[key] != consumer_layers[key] for key in shared):
         return (
             "DeepSeek-V4.1 cache-only Mooncake handoff requires matching "
             "Main-KV/Indexer-K regions on producer and consumer."
