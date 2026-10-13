@@ -1016,6 +1016,16 @@ class MooncakeConnectorWorker:
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.pp_rank = get_pp_group().rank_in_group
+        # Under PP a stage may hold mirrors of upstream KV source layers
+        # (DSv4.1 cross-stage relay); only the layers this stage owns are
+        # exported.
+        self._pp_start_layer = (
+            vllm_config.model_config.get_layers_start_end_indices(
+                vllm_config.parallel_config
+            )[0]
+            if self.pp_size > 1
+            else 0
+        )
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
@@ -1729,6 +1739,12 @@ class MooncakeConnectorWorker:
 
         for layer_name, cache in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
+            if layer_index < self._pp_start_layer:
+                logger.info(
+                    "Not exporting %s: a mirror of an upstream stage's layer.",
+                    layer_name,
+                )
+                continue
             layer_spec = self._layer_specs.get(layer_name)
             if layer_spec is None:
                 logger.debug(
