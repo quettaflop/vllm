@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import queue
 import threading
 import time
@@ -68,6 +69,10 @@ from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.worker.utils import select_common_block_size
 
 logger = init_logger(__name__)
+
+# Equal PP sizes with different layer splits: every consumer stage pulls every
+# producer stage, as for different PP sizes.
+_PP_ANY_PARTITION = os.environ.get("VLLM_MOONCAKE_PP_ANY_PARTITION", "0") == "1"
 
 try:
     from mooncake.engine import TransferEngine
@@ -1283,7 +1288,8 @@ class MooncakeConnectorWorker:
             local_regions,
             remote_regions,
             allow_partial_layers=(
-                meta.remote_pp_size > 1 and meta.remote_pp_size != self.pp_size
+                meta.remote_pp_size > 1
+                and (meta.remote_pp_size != self.pp_size or _PP_ANY_PARTITION)
             ),
         )
         if align_err is not None:
@@ -1456,7 +1462,7 @@ class MooncakeConnectorWorker:
     ):
         # Prepare for heterogeneous TP (one P pairs to multiple D)
         send_meta.need_send = len(remote_tp_ranks)
-        if remote_pp_size > 1 and remote_pp_size != self.pp_size:
+        if remote_pp_size > 1 and (remote_pp_size != self.pp_size or _PP_ANY_PARTITION):
             # Each consumer PP stage pulls every producer stage, including
             # peers with no shared layers.
             send_meta.need_send *= remote_pp_size
@@ -2073,7 +2079,11 @@ class MooncakeConnectorWorker:
         selected_remote_pp: dict[int, list[int]] = {}
         for remote_tp_rank in remote_tp_ranks:
             pp_to_addr = self._remote_agents[remote_engine_id][remote_tp_rank]
-            if self.pp_size == len(pp_to_addr) and self.pp_rank in pp_to_addr:
+            if (
+                self.pp_size == len(pp_to_addr)
+                and self.pp_rank in pp_to_addr
+                and not _PP_ANY_PARTITION
+            ):
                 pp_ranks = [self.pp_rank]
             else:
                 pp_ranks = sorted(pp_to_addr)
