@@ -225,11 +225,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if self.use_sequence_parallel:
             self.attn.wo_b.reduce_results = False
-        self.ffn = DeepseekV4MoE(
-            vllm_config,
-            prefix=f"{prefix}.ffn",
-            use_sequence_parallel=self.use_sequence_parallel,
-        )
+        self.ffn: DeepseekV4MoE | PPMissingLayer
+        if vllm_config.is_dsv41_encoder_only_prefill and extract_layer_index(
+            prefix
+        ) == dsv41_encoder_only_boundary_layer(config):
+            # An encoder-only producer writes only this layer's global cache;
+            # its FFN (the bulk of the layer) is neither built nor loaded.
+            self.ffn = PPMissingLayer()
+        else:
+            self.ffn = DeepseekV4MoE(
+                vllm_config,
+                prefix=f"{prefix}.ffn",
+                use_sequence_parallel=self.use_sequence_parallel,
+            )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -672,18 +680,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     [k for k, _, _ in relay_tensor_shapes(config, relay, recv=False)],
                 )
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: DeepseekV4DecoderLayer(
+        # Encoder-only prefill node: the stage holding the boundary (the last
+        # KV source, L20) stops after writing its global KV, and the decoder
+        # layers after it are neither built nor loaded.
+        self.encoder_only_boundary: int | None = None
+        if vllm_config.is_dsv41_encoder_only_prefill:
+            self.encoder_only_boundary = dsv41_encoder_only_boundary_layer(config)
+        boundary = self.encoder_only_boundary
+
+        def make_layer(prefix: str) -> nn.Module:
+            if boundary is not None and extract_layer_index(prefix) > boundary:
+                return PPMissingLayer()
+            return DeepseekV4DecoderLayer(
                 vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
                 candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
-            ),
-            prefix=f"{prefix}.layers",
+            )
+
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers, make_layer, prefix=f"{prefix}.layers"
         )
+        if boundary is not None:
+            self.end_layer = min(self.end_layer, boundary + 1)
 
         # Source layers whose step output a later stage mirrors write it into
         # persistent buffers, which this stage sends on.
@@ -706,11 +727,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_layers: DecoderReplayLayers | None = None
         cut = max(config.kv_source_layer_ids)
         self.decoder_replay_cut = cut
-        # Encoder-only prefill node: the stage holding the boundary (the last
-        # KV source, L20) stops after writing its global KV.
-        self.encoder_only_boundary: int | None = None
-        if vllm_config.is_dsv41_encoder_only_prefill:
-            self.encoder_only_boundary = dsv41_encoder_only_boundary_layer(config)
         if (
             self.encoder_only_boundary is None
             and cut < self.end_layer - 1
@@ -1430,7 +1446,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        first_layer = next(iter(islice(self.layers, self.start_layer, self.end_layer)))
+        first_layer = next(
+            layer
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if isinstance(layer.ffn, DeepseekV4MoE)
+        )
         if first_layer.ffn.use_mega_moe:
             return make_deepseek_v4_expert_params_mapping(self.config.n_routed_experts)
         # Params for weights, fp8 weight scales, fp8 activation scales
@@ -1445,7 +1465,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def finalize_mega_moe_weights(self) -> None:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            layer.ffn.finalize_mega_moe_weights()
+            if isinstance(layer.ffn, DeepseekV4MoE):
+                layer.ffn.finalize_mega_moe_weights()
 
     def finalize_mhc_broadcast_weights(self) -> None:
         if not get_pp_group().is_first_rank or self.start_layer >= self.end_layer:

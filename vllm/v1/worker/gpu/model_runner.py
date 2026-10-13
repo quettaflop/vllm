@@ -2023,7 +2023,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
-            all_decode_next = self.pp_handler.receive(input_batch)
+            # An encoder-only prefill node's last stage samples nothing and so
+            # broadcasts nothing; receiving would wait forever.
+            all_decode_next = (
+                False
+                if self.is_dsv41_encoder_only_prefill
+                else self.pp_handler.receive(input_batch)
+            )
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)

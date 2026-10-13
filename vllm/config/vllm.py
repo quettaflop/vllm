@@ -2733,8 +2733,28 @@ class VllmConfig:
             )
         if not self.use_v2_model_runner:
             raise ValueError("dsv41_encoder_only_prefill requires model runner V2.")
-        if self.parallel_config.pipeline_parallel_size != 1:
-            raise ValueError("dsv41_encoder_only_prefill requires PP=1.")
+        pp_size = self.parallel_config.pipeline_parallel_size
+        if pp_size != 1:
+            # A pipeline-parallel producer is supported when its last stage owns
+            # the boundary (L20): earlier stages run encoder layers and relay,
+            # the last one stops after the boundary's global cache.
+            if kv_config.kv_role != "kv_producer":
+                raise ValueError(
+                    "dsv41_encoder_only_prefill requires PP=1 on the consumer."
+                )
+            from vllm.distributed.utils import get_pp_indices
+
+            hf_text_config = model_config.hf_text_config
+            boundary = dsv41_encoder_only_boundary_layer(hf_text_config)
+            last_start, _ = get_pp_indices(
+                hf_text_config.num_hidden_layers, pp_size - 1, pp_size
+            )
+            if last_start > boundary:
+                raise ValueError(
+                    "dsv41_encoder_only_prefill with PP needs the last pipeline "
+                    f"stage to own layer {boundary}; it starts at {last_start}. "
+                    "Set VLLM_PP_LAYER_PARTITION, e.g. 5,5,5,25."
+                )
         if self.parallel_config.prefill_context_parallel_size != 1:
             raise ValueError(
                 "dsv41_encoder_only_prefill does not support prefill context "
