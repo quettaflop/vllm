@@ -1790,7 +1790,11 @@ class MooncakeConnectorWorker:
 
         for layer_name, cache in kv_caches.items():
             layer_index = extract_layer_index(layer_name)
-            if layer_index < self._pp_start_layer:
+            if self.is_kv_producer and layer_index < self._pp_start_layer:
+                # A producer stage's mirror would write the consumer's blocks a
+                # second time. A consumer stage must register its mirrors: the
+                # relay copies new tokens into them, but their prompt KV comes
+                # from this transfer.
                 logger.info(
                     "Not exporting %s: a mirror of an upstream stage's layer.",
                     layer_name,
