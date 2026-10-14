@@ -6,6 +6,7 @@ and updated to fit vllm needs and terminology.
 """
 
 import math
+import os
 
 import torch
 
@@ -14,6 +15,17 @@ from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
+
+
+def _quetta_align_cap(alignment: int, expected_m: int, local_num_experts: int) -> int:
+    # DeepGEMM's sm120 heuristic picks BLOCK_M 128 for every expected_m, so decode
+    # pads a few rows per expert to 128. VLLM_DG_MOE_ALIGN_CAP (e.g. 64) caps the
+    # per-expert alignment, and with it BLOCK_M via mk_alignment_scope, when
+    # experts average <= cap rows. Results are bit-identical; default off.
+    cap = int(os.environ.get("VLLM_DG_MOE_ALIGN_CAP", "0"))
+    if cap and cap < alignment and expected_m <= cap * max(1, local_num_experts):
+        return cap
+    return alignment
 
 
 def expert_num_tokens_round_up_and_sum(
@@ -47,6 +59,7 @@ def compute_aligned_M_and_alignment(
     if (expert_tokens_meta is not None) and (
         expert_tokens_meta.expert_num_tokens_cpu is not None
     ):
+        alignment = _quetta_align_cap(alignment, M * num_topk, local_num_experts)
         return (
             expert_num_tokens_round_up_and_sum(
                 expert_tokens_meta.expert_num_tokens_cpu, alignment=alignment
@@ -77,6 +90,7 @@ def compute_aligned_M_and_alignment(
     except Exception:
         pass
 
+    alignment = _quetta_align_cap(alignment, expected_m, local_num_experts)
     max_active_experts = min(M * num_topk, local_num_experts)
     M_sum = (M * num_topk) + max_active_experts * (alignment - 1)
     M_sum = round_up(M_sum, alignment)
