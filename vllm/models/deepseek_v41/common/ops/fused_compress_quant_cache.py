@@ -236,9 +236,10 @@ def rope_quant_insert(
     per-token byte width names -- 584 B for V4 (576 value bytes and eight
     segregated UE8M0 scale bytes, including one zero padding scale) or 528 B
     for V4.1 (512 MXFP8 value bytes covering the RoPE dims too, then 16 UE8M0
-    scales of 32 dims each). ``bfloat16`` and ``float8_e4m3fn`` are the plain
-    [448 NoPE | 64 RoPE] rows read by FlashInfer, the latter scaled by the
-    per-tensor ``fp8_scale``.
+    scales of 32 dims each), or 288 B V41_FP4 rows on SM120 (256 packed E2M1
+    bytes for all 512 dims, then 32 E4M3 scales of 16 dims each).
+    ``bfloat16`` and ``float8_e4m3fn`` are the plain [448 NoPE | 64 RoPE] rows
+    read by FlashInfer, the latter scaled by the per-tensor ``fp8_scale``.
     """
     assert compress_ratio in (1, 2)
     assert latent.shape[1] == 512 and latent.dtype == torch.bfloat16
@@ -248,6 +249,17 @@ def rope_quant_insert(
     if num_tokens == 0:
         return
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+    if kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 288:
+        _rope_fp4_insert(
+            latent,
+            positions,
+            cos_sin_cache,
+            kv_cache,
+            slot_mapping,
+            compress_ratio,
+            launch_kwargs,
+        )
+        return
     if kv_cache.dtype == torch.uint8:
         assert kv_cache.shape[-1] in (584, 528), (
             f"unsupported paged KV record width {kv_cache.shape[-1]}"
@@ -346,6 +358,57 @@ def _rope_quant_insert_kernel(
         rotated = tl.where(rotated == rotated, rotated, 0.0)
     rope_dst = (values + 448).to(tl.pointer_type(tl.bfloat16))
     tl.store(rope_dst + d - 448, rotated.to(tl.bfloat16), d >= 448)
+
+
+def _rope_fp4_insert(
+    latent: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    compress_ratio: int,
+    launch_kwargs: dict,
+) -> None:
+    """Publish V41_FP4 compressed rows through FlashInfer's own quantizer.
+
+    The plain-row kernel rotates each publishing token's latent into a BF16
+    scratch row; FlashInfer then quantizes those rows into the page layout its
+    SM120 sparse MLA reads (all data rows, then all scale rows). Only tokens at
+    a group boundary publish. FlashInfer keeps the lowest-index row of a
+    duplicated slot, so the other tokens of a group are masked out of the slot
+    mapping it sees.
+    """
+    from flashinfer.mla import dsv41_fp4_quantize_append_sparse_mla_cache
+
+    num_tokens = slot_mapping.numel()
+    publish = (slot_mapping >= 0) & ((positions[:num_tokens] + 1) % compress_ratio == 0)
+    rows = torch.empty((num_tokens, 1, 512), dtype=torch.bfloat16, device=latent.device)
+    row_slots = torch.where(
+        publish,
+        torch.arange(num_tokens, device=slot_mapping.device, dtype=slot_mapping.dtype),
+        -1,
+    )
+    _rope_plain_insert_kernel[(num_tokens,)](
+        latent,
+        positions,
+        cos_sin_cache,
+        rows,
+        row_slots,
+        None,
+        COS_STRIDE=cos_sin_cache.stride(0),
+        CACHE_STRIDE=rows.stride(0),
+        ROW_STRIDE=rows.stride(1),
+        CACHE_BLOCK=1,
+        COMPRESS_RATIO=compress_ratio,
+        STORE_FP8=False,
+        num_warps=4,
+        **launch_kwargs,
+    )
+    dsv41_fp4_quantize_append_sparse_mla_cache(
+        rows.view(num_tokens, 512),
+        torch.where(publish, slot_mapping, -1),
+        kv_cache,
+    )
 
 
 @triton.jit

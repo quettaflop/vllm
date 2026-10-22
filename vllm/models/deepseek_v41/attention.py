@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import cached_property
@@ -110,14 +111,44 @@ def _fill_short_context_topk_indices(
     )
 
 
+def _sm120_kv_format() -> str:
+    """The SM120 KV record selected by VLLM_DSV41_SM120_KV_FORMAT.
+
+    ``v4`` (default) is the 584 B V4 record in both caches. ``v41`` is
+    DeepSeek's 528 B V4.1 MXFP8 record in both caches. ``v41_fp4`` keeps the
+    528 B record in the sliding-window cache and stores the compressed cache as
+    288 B V41_FP4 rows (packed E2M1 with one E4M3 scale per 16 dims), the
+    format DeepSeek's reference code and DeepInfer use. FlashInfer's SM120
+    sparse MLA reads the last two as ``fp8_dsv41`` / ``fp8_dsv41_fp4_ca``.
+    """
+    fmt = os.environ.get("VLLM_DSV41_SM120_KV_FORMAT", "v4")
+    if fmt not in ("v4", "v41", "v41_fp4"):
+        raise ValueError(
+            f"VLLM_DSV41_SM120_KV_FORMAT must be v4, v41 or v41_fp4, got {fmt!r}"
+        )
+    return fmt
+
+
 # Which packed fp8_ds_mla record a V4.1 layer writes. FlashMLA decodes
 # DeepSeek's V4.1 record -- all 512 dims (RoPE included) as fp8 e4m3 with one
 # UE8M0 scale per 32 dims, 512 data bytes + 16 scale bytes per token, pages
 # rounded to the kernel's 512 B TMA stride -- only in its SM100 sparse-decode
-# kernels. Every other arch keeps the V4 record: 448 fp8 NoPE + 64 bf16 RoPE
-# plus 7 UE8M0 scales of 64 dims and a pad byte (584 B, 576 B pages).
+# kernels. FlashInfer's SM120 sparse MLA reads it too, so SM120 opts in with
+# VLLM_DSV41_SM120_KV_FORMAT. Every other arch keeps the V4 record: 448 fp8
+# NoPE + 64 bf16 RoPE plus 7 UE8M0 scales of 64 dims and a pad byte (584 B,
+# 576 B pages).
 def _use_v41_mxfp8_kv_record() -> bool:
+    if current_platform.is_device_capability_family(120):
+        return _sm120_kv_format() != "v4"
     return current_platform.is_device_capability_family(100)
+
+
+# Whether the compressed cache holds 288 B V41_FP4 rows (SM120 only).
+def _use_v41_fp4_compressed_kv() -> bool:
+    return (
+        current_platform.is_device_capability_family(120)
+        and _sm120_kv_format() == "v41_fp4"
+    )
 
 
 def _resolve_dsv4_kv_cache_dtype(
@@ -474,6 +505,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
         self.kv_bytes_per_token = 528 if self.kv_mxfp8 else 584
         self.kv_page_alignment = 512 if self.kv_mxfp8 else 576
+        # The compressed cache's record; the SWA cache keeps kv_bytes_per_token.
+        self.kv_fp4_compressed = _use_v41_fp4_compressed_kv()
+        self.compressed_kv_bytes_per_token = (
+            288 if self.kv_fp4_compressed else self.kv_bytes_per_token
+        )
+        if (
+            self.kv_fp4_compressed
+            and vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            # pp_kv_relay mirrors compressed rows with the FP8 record writer.
+            raise NotImplementedError(
+                "VLLM_DSV41_SM120_KV_FORMAT=v41_fp4 does not support pipeline "
+                "parallelism yet."
+            )
 
         swa_bounded_replay = cache_config.swa_bounded_replay
         if swa_bounded_replay and not vllm_config.use_v2_model_runner:
@@ -1106,7 +1151,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # Packed record width; head_size stays semantic (512).
             state_content_bytes=(
-                self.kv_bytes_per_token if uses_fp8_ds_mla_layout else None
+                self.compressed_kv_bytes_per_token if uses_fp8_ds_mla_layout else None
             ),
         )
 

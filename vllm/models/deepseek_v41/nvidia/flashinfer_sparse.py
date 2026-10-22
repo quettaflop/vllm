@@ -611,6 +611,16 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(
             self._o_proj_block_size
         )
+        # FlashInfer's name for the packed records the two caches hold (see
+        # _sm120_kv_format): 584 B V4 rows, 528 B V4.1 rows, or 528 B SWA rows
+        # with 288 B V41_FP4 compressed rows.
+        self._fi_kv_cache_format = (
+            "fp8_dsv41_fp4_ca"
+            if self.kv_fp4_compressed
+            else "fp8_dsv41"
+            if self.kv_mxfp8
+            else "fp8"
+        )
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
             return
@@ -634,6 +644,13 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         # FlashInfer expects scalar scale arguments for this path.
         self._flashinfer_fp8_bmm1_scale = self.scale * fp8_q_scale * fp8_kv_scale
         self._flashinfer_fp8_bmm2_scale = fp8_kv_scale
+
+    def _fi_format(self, has_compressed: bool) -> str:
+        # The mixed FP8/FP4 format needs a compressed segment; SWA-only calls
+        # read the same 528 B SWA record as plain fp8_dsv41.
+        if self.kv_fp4_compressed and not has_compressed:
+            return "fp8_dsv41"
+        return self._fi_kv_cache_format
 
     def _reserve_empty_forward_workspace(self) -> None:
         self._get_workspace(
@@ -807,6 +824,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
+            kv_cache_format=self._fi_format(extra_cache is not None),
         )
 
     def _forward_prefill(
@@ -926,4 +944,5 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+                kv_cache_format=self._fi_format(extra_kv_paged is not None),
             )
