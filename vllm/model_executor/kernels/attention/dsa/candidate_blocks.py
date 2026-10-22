@@ -232,3 +232,137 @@ def apply_candidate_mask(
         row_repeat,
         1024,
     )
+
+
+# Decode variant: the decode logits are max_model_len wide (a workspace sized at
+# capture), but each row only has `end` live columns. The shared kernels above
+# clear a flag per block and mask every column of that width, which costs about
+# 1.1 ms per call at 384 rows and a 1M width on sm_120. These two do the same
+# work over [start, end) only, so their cost follows the live context. Columns at
+# or past `end` are left as they are: every top-k backend bounds its scan by the
+# same row ends (see _mask_candidates_strided_kernel, the ROCm equivalent).
+@triton.jit(do_not_specialize=["width", "nblocks"])
+def _candidate_flags_bounded_kernel(
+    candidates,
+    starts,
+    ends,
+    flags,
+    stride_row,
+    stride_col,
+    stride_start,
+    stride_end,
+    width,
+    nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    K: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    end = tl.load(ends + row // ROW_REPEAT * stride_end)
+    # The mask reads flags only for blocks inside [start, end) and the edge slot.
+    row_blocks = tl.minimum(tl.cdiv(tl.maximum(end - start, 0), BLOCK_SIZE), nblocks)
+    offsets = tl.arange(0, 1024)
+    for tile in range(tl.cdiv(row_blocks, 1024)):
+        slots = tile * 1024 + offsets
+        tl.store(flags + row * (nblocks + 1) + slots, 0, slots < row_blocks)
+    tl.store(flags + row * (nblocks + 1) + nblocks, 0)
+    cols = tl.arange(0, triton.next_power_of_2(K))
+    block = tl.load(
+        candidates + row * stride_row + cols * stride_col, cols < K, other=-1
+    ).to(tl.int64)
+    # Preserve the packed-column clamp for candidates beyond the logits width.
+    block = tl.where(start + block * BLOCK_SIZE >= width, nblocks, block)
+    tl.debug_barrier()
+    tl.store(flags + row * (nblocks + 1) + block, 1, (cols < K) & (block >= 0))
+
+
+@triton.jit(do_not_specialize=["width", "nblocks"])
+def _mask_candidates_bounded_kernel(
+    logits,
+    starts,
+    ends,
+    flags,
+    stride_row,
+    stride_col,
+    stride_start,
+    stride_end,
+    width,
+    nblocks,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_STARTS: tl.constexpr,
+    ROW_REPEAT: tl.constexpr,
+    TILE: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
+    end = tl.load(ends + row // ROW_REPEAT * stride_end)
+    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
+    for tile in range(tl.program_id(1), tl.cdiv(tl.minimum(end, width), TILE), SPLITS):
+        cols = tile * TILE + tl.arange(0, TILE)
+        valid = (cols >= start) & (cols < end) & (cols < width)
+        block = (cols - start) // BLOCK_SIZE
+        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
+        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
+        tl.store(
+            logits + row * stride_row + cols * stride_col,
+            -float("inf"),
+            (cols < end) & (cols < width) & ~(valid & keep),
+        )
+
+
+def apply_candidate_mask_bounded(
+    logits: torch.Tensor,
+    row_ks: torch.Tensor | None,
+    row_ke: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+    block_size: int,
+    row_repeat: int = 1,
+) -> None:
+    """``apply_candidate_mask`` over each row's ``[start, end)`` only.
+
+    For the decode logits, whose width is ``max_model_len``. The grid depends on
+    the logits shape only, so a FULL cudagraph capture stays valid; the loop
+    trip counts follow the row ends.
+    """
+    assert logits.is_cuda
+    rows, width = logits.shape
+    if not rows or not width:
+        return
+    nblocks = triton.cdiv(width, block_size)
+    flags = torch.empty((rows, nblocks + 1), device=logits.device, dtype=torch.uint8)
+    start_stride = row_ks.stride(0) if row_ks is not None else 0
+    _candidate_flags_bounded_kernel[(rows,)](
+        candidate_blocks,
+        row_ks,
+        row_ke,
+        flags,
+        *candidate_blocks.stride(),
+        start_stride,
+        row_ke.stride(0),
+        width,
+        nblocks,
+        block_size,
+        candidate_blocks.shape[1],
+        row_ks is not None,
+        row_repeat,
+    )
+    splits = min(triton.cdiv(width, 1024), 16)
+    _mask_candidates_bounded_kernel[(rows, splits)](
+        logits,
+        row_ks,
+        row_ke,
+        flags,
+        *logits.stride(),
+        start_stride,
+        row_ke.stride(0),
+        width,
+        nblocks,
+        block_size,
+        row_ks is not None,
+        row_repeat,
+        1024,
+        splits,
+    )

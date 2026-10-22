@@ -18,6 +18,9 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     apply_candidate_mask as _apply_candidate_mask,
 )
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+    apply_candidate_mask_bounded as _apply_candidate_mask_bounded,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
 from vllm.model_executor.layers.indexer_topk import (
@@ -777,7 +780,9 @@ def sparse_attn_indexer(
                         row_repeat,
                     )
                 else:
-                    _apply_candidate_mask(
+                    # The decode logits are max_model_len wide; mask only each
+                    # row's live columns.
+                    _apply_candidate_mask_bounded(
                         logits,
                         None,
                         vis,
