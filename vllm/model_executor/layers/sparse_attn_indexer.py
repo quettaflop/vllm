@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -22,6 +24,10 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 )
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
+)
+from vllm.model_executor.kernels.attention.dsa.candidate_logits import (
+    candidate_mqa_logits,
+    candidate_topk_to_positions,
 )
 from vllm.model_executor.layers.indexer_topk import (
     RADIX_TOPK_WORKSPACE_SIZE,
@@ -702,11 +708,25 @@ def sparse_attn_indexer(
         )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         chunk_size = batch_size
+        # Consumer indexers can score only their candidate positions instead of
+        # the whole context (FP8 index cache, no DCP); opt-in.
+        use_candidate_logits = (
+            candidate_blocks is not None
+            and not candidate_write
+            and not use_fp4_cache
+            and padded_q_scale is None
+            and current_platform.is_cuda()
+            and dcp_world_size == 1
+            and decode_metadata.indices is None
+            and decode_metadata.global_seq_lens is None
+            and os.environ.get("VLLM_INDEXER_CANDIDATE_LOGITS", "0") == "1"
+        )
         if (
             current_platform.is_cuda()
             and dcp_world_size == 1
             and decode_metadata.indices is None
             and decode_metadata.global_seq_lens is None
+            and not use_candidate_logits
         ):
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
             chunk_size = min(
@@ -716,6 +736,35 @@ def sparse_attn_indexer(
             batch_end = min(batch_start + chunk_size, batch_size)
             row_start, row_end = batch_start * next_n, batch_end * next_n
             chunk_seq_lens = seq_lens[batch_start:batch_end]
+            if use_candidate_logits:
+                assert candidate_blocks is not None
+                chunk_candidates = candidate_blocks[row_start:row_end]
+                cand_logits = candidate_mqa_logits(
+                    padded_q_quant_cast[batch_start:batch_end],
+                    kv_cache,
+                    weights[row_start:row_end],
+                    chunk_seq_lens,
+                    decode_metadata.block_table[batch_start:batch_end],
+                    chunk_candidates,
+                    candidate_block_size,
+                )
+                cand_cols = torch.empty_like(topk_indices[row_start:row_end])
+                get_indexer_topk(topk_backend)(
+                    cand_logits,
+                    torch.full_like(chunk_seq_lens, cand_logits.shape[1]),
+                    next_n,
+                    cand_cols,
+                    topk_tokens,
+                    cand_logits.shape[1],
+                )
+                candidate_topk_to_positions(
+                    cand_cols,
+                    cand_logits,
+                    chunk_candidates,
+                    candidate_block_size,
+                    topk_indices[row_start:row_end],
+                )
+                continue
             chunk_schedule = decode_metadata.schedule_metadata
             if chunk_size < batch_size:
                 chunk_schedule = get_paged_mqa_logits_metadata(
